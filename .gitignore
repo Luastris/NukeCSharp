@@ -1,0 +1,4 @@
+# Build output (CMake tree + the managed bridge's dotnet artifacts).
+build/
+managed/NukeEngine.Managed/bin/
+managed/NukeEngine.Managed/obj/

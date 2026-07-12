@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The engine's managed bridge: hosted by the NukeMono native module through hostfxr.
+       Ships beside the module (modules/managed/). net8.0 = the lowest runtime the host
+       accepts (a newer installed runtime rolls forward automatically). -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <!-- net8.0 is the FLOOR; any newer installed runtime (9, 10, ...) hosts it. -->
+    <RollForward>LatestMajor</RollForward>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <AssemblyName>NukeEngine.Managed</AssemblyName>
+    <RootNamespace>NukeEngine</RootNamespace>
+    <Company>Luastris</Company>
+    <Product>NukeEngine</Product>
+  </PropertyGroup>
+
+</Project>
