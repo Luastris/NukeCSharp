@@ -2,3 +2,13 @@
 build/
 managed/NukeEngine.Managed/bin/
 managed/NukeEngine.Managed/obj/
+
+# Visual Studio / IDE
+.vs/
+*.user
+*.suo
+
+# logs / OS
+*.log
+Thumbs.db
+.DS_Store
