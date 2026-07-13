@@ -78,6 +78,8 @@ internal unsafe struct NativeApi
     public delegate* unmanaged[Cdecl]<byte*, long, double, int, int, double> playAudioData;
     // The atom's live Transform wrapped as a reflected OBJECT handle (0 = dead atom).
     public delegate* unmanaged[Cdecl]<long, long> atomTransformObject;
+    // Reflected [[nuke::func]] methods on the ATOM itself (GetName/SetParent/Destroy/...).
+    public delegate* unmanaged[Cdecl]<long, byte*, byte*, byte*, int, int> atomInvoke;
 }
 
 internal static unsafe class Native
@@ -283,6 +285,20 @@ internal static unsafe class Native
     }
     internal static long AtomTransformObject(long atomId)
         => Api.atomTransformObject != null ? Api.atomTransformObject(atomId) : 0;
+    internal static (bool ok, string? ret) AtomInvoke(long atomId, string method, string argsJson)
+    {
+        if (Api.atomInvoke == null) return (false, null);
+        fixed (byte* m = Utf8(method))
+        fixed (byte* a = Utf8(argsJson))
+        {
+            int need = Api.atomInvoke(atomId, m, a, null, 0);
+            if (need < 0) return (false, null);
+            if (need == 0) return (true, null);
+            var buf = new byte[need];
+            fixed (byte* b = buf) Api.atomInvoke(atomId, m, a, b, need);
+            return (true, System.Text.Encoding.UTF8.GetString(buf));
+        }
+    }
     internal static void GetTransform(long atomId, double* t9) { if (Api.getTransform != null) Api.getTransform(atomId, t9); }
     internal static void SetTransform(long atomId, double* t9) { if (Api.setTransform != null) Api.setTransform(atomId, t9); }
     internal static void TimeInfo(out double delta, out double elapsed)
@@ -461,6 +477,45 @@ public sealed unsafe class Atom
         long id = Native.FindAtom(name);
         return id != 0 ? new Atom(id) : null;
     }
+
+    // A reflected [[nuke::func]] method on the atom itself (JSON literal in/out, null = void).
+    string? AtomCall(string method, params object?[] args)
+    {
+        var (ok, ret) = Native.AtomInvoke(Id, method, System.Text.Json.JsonSerializer.Serialize(args));
+        if (!ok) Native.Log($"[NukeCSharp] Atom.{method} call failed (dead atom or bad args)");
+        return ret;
+    }
+    static string JsonString(string? r)
+    {
+        try { return r != null ? System.Text.Json.JsonSerializer.Deserialize<string>(r) ?? "" : ""; } catch { return ""; }
+    }
+
+    public string Name
+    {
+        get => JsonString(AtomCall("GetName"));
+        set => AtomCall("SetName", value);
+    }
+    public string Tag
+    {
+        get => JsonString(AtomCall("GetTag"));
+        set => AtomCall("SetTag", value);
+    }
+    // Parenting — same semantics as the engine: SetParent(null) moves to the world root.
+    public Atom? Parent
+    {
+        get
+        {
+            var r = AtomCall("GetParent");
+            return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) && d != 0
+                 ? new Atom((long)d) : null;
+        }
+        set => AtomCall("SetParent", (double)(value?.Id ?? 0));
+    }
+    public void SetParent(Atom? parent) => AtomCall("SetParent", (double)(parent?.Id ?? 0));
+    public void AddChild(Atom child)    => AtomCall("AddChild", (double)child.Id);
+    // DEFERRED destruction of this atom's whole subtree (applied at the end of the frame's
+    // Update — safe to call on your own atom from inside Update/collision callbacks).
+    public void Destroy() => AtomCall("Destroy");
 
     public Vector3 Position
     {

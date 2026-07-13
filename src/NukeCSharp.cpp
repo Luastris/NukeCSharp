@@ -143,6 +143,11 @@ struct NativeApi
 	// The atom's LIVE Transform as a reflected OBJECT handle (0 = dead atom): the full
 	// reflected surface — quaternion rotation, [[nuke::func]] math — not a baked float trio.
 	long long (__cdecl* atomTransformObject)(long long atomId);
+	// Reflected [[nuke::func]] methods ON THE ATOM ITSELF (GetName/SetName, GetParent/
+	// SetParent, AddChild, Destroy, ...) — the same JSON channel as invoke, resolved
+	// against TypeOf<Atom> (atoms travel as stable ids, never object handles).
+	int  (__cdecl* atomInvoke)(long long atomId, const char* method, const char* argsJson,
+	                           char* outJson, int cap);                      // ret len (0 = void), -1 = fail
 };
 
 static void __cdecl NativeLog(const char* utf8)
@@ -195,6 +200,7 @@ static std::string RvToJson(const ReflectValue& v)
 		case FT::Quat:
 		case FT::Color:  j = { v.v[0], v.v[1], v.v[2], v.v[3] }; break;
 		case FT::AtomRef: j = (unsigned long long)v.atom; break;
+		case FT::ObjectRef: j = (unsigned long long)v.obj; break;   // engine object-handle id
 		default: return std::string();   // void / unsupported
 	}
 	return j.dump();
@@ -223,8 +229,39 @@ static bool JsonToRv(const nlohmann::json& j, FT want, ReflectValue& out)
 			return true;
 		}
 		case FT::AtomRef: if (!j.is_number()) return false; out.atom = (unsigned long)j.get<unsigned long long>(); return true;
+		case FT::ObjectRef: if (!j.is_number()) return false; out.obj = (unsigned long)j.get<unsigned long long>(); return true;
 		default: return false;
 	}
+}
+
+static int PutStr(const std::string& s, char* buf, int cap)
+{
+	if (buf && cap > 0) memcpy(buf, s.data(), (size_t)((int)s.size() < cap ? (int)s.size() : cap));
+	return (int)s.size();
+}
+// The INVOKE channels return through the two-call sized-string protocol (probe the length
+// with a null buffer, then fetch into a buffer). A method must EXECUTE EXACTLY ONCE — the
+// probe runs it and caches the result JSON per thread; the fetch only copies the cache.
+// (Executing on both calls double-fired every non-void method: World.CreateAtom spawned
+// TWO atoms, Audio.Play would play twice. Pure getters keep the plain PutStr path.)
+static thread_local std::string tlsInvokeCache;
+static thread_local bool        tlsInvokeCached = false;
+template<class Exec>   // Exec: bool(std::string& outJson) — runs the method, fills the result ("" = void)
+static int InvokeOnce(Exec exec, char* outJson, int cap)
+{
+	if (!outJson)   // probe: execute once + cache
+	{
+		tlsInvokeCache.clear();
+		tlsInvokeCached = false;
+		if (!exec(tlsInvokeCache)) return -1;
+		tlsInvokeCached = true;
+		return (int)tlsInvokeCache.size();   // 0 = void (no fetch follows)
+	}
+	// fetch: serve the probe's cached result; execute only on a direct big-buffer call
+	std::string js;
+	if (tlsInvokeCached) { js.swap(tlsInvokeCache); tlsInvokeCached = false; }
+	else if (!exec(js)) return -1;
+	return PutStr(js, outJson, cap);
 }
 
 static long long __cdecl NativeFindAtom(const char* name)
@@ -276,22 +313,22 @@ static int __cdecl NativeSetProp(long long atomId, long long compId, const char*
 static int __cdecl NativeInvoke(long long atomId, long long compId, const char* method,
                                 const char* argsJson, char* outJson, int cap)
 {
-	Component* c = Reflect_ResolveComponent((unsigned long)atomId, (unsigned long)compId);
-	if (!c || !method || !c->GetType()) return -1;
-	const Method* m = Reflect_FindMethod(c->GetType(), method);
-	if (!m) return -1;
-	nlohmann::json args = argsJson && *argsJson ? nlohmann::json::parse(argsJson, nullptr, false)
-	                                            : nlohmann::json::array();
-	if (args.is_discarded() || !args.is_array() || args.size() != m->params.size()) return -1;
-	std::vector<ReflectValue> rv(m->params.size());
-	for (size_t i = 0; i < m->params.size(); ++i)
-		if (!JsonToRv(args[i], m->params[i], rv[i])) return -1;
-	ReflectValue ret;
-	if (!Reflect_Invoke(c, *m, rv.data(), rv.size(), ret)) return -1;
-	std::string js = RvToJson(ret);
-	if (js.empty()) return 0;   // void return
-	if (outJson && cap > 0) memcpy(outJson, js.data(), (size_t)((int)js.size() < cap ? (int)js.size() : cap));
-	return (int)js.size();
+	return InvokeOnce([&](std::string& out) -> bool {
+		Component* c = Reflect_ResolveComponent((unsigned long)atomId, (unsigned long)compId);
+		if (!c || !method || !c->GetType()) return false;
+		const Method* m = Reflect_FindMethod(c->GetType(), method);
+		if (!m) return false;
+		nlohmann::json args = argsJson && *argsJson ? nlohmann::json::parse(argsJson, nullptr, false)
+		                                            : nlohmann::json::array();
+		if (args.is_discarded() || !args.is_array() || args.size() != m->params.size()) return false;
+		std::vector<ReflectValue> rv(m->params.size());
+		for (size_t i = 0; i < m->params.size(); ++i)
+			if (!JsonToRv(args[i], m->params[i], rv[i])) return false;
+		ReflectValue ret;
+		if (!Reflect_Invoke(c, *m, rv.data(), rv.size(), ret)) return false;
+		out = RvToJson(ret);   // "" = void
+		return true;
+	}, outJson, cap);
 }
 static void __cdecl NativeGetTransform(long long atomId, double* t9)
 {
@@ -377,11 +414,6 @@ static long long __cdecl NativeFindAsset(const char* type, const char* name)
 {
 	return name ? (long long)Reflect_FindAsset(type ? type : "", name) : 0;
 }
-static int PutStr(const std::string& s, char* buf, int cap)
-{
-	if (buf && cap > 0) memcpy(buf, s.data(), (size_t)((int)s.size() < cap ? (int)s.size() : cap));
-	return (int)s.size();
-}
 static int __cdecl NativeObjectGuid(long long objId, char* buf, int cap)
 {
 	return PutStr(Reflect_ObjectGuid((unsigned long)objId), buf, cap);
@@ -411,21 +443,23 @@ static int __cdecl NativeObjSet(long long objId, const char* name, const char* v
 static int __cdecl NativeObjInvoke(long long objId, const char* method, const char* argsJson,
                                    char* outJson, int cap)
 {
-	if (!method) return -1;
-	TypeInfo* ti = Registry_Find(Reflect_ObjectType((unsigned long)objId));
-	if (!ti) return -1;
-	const Method* m = Reflect_FindMethod(ti, method);
-	if (!m) return -1;
-	nlohmann::json args = argsJson && *argsJson ? nlohmann::json::parse(argsJson, nullptr, false)
-	                                            : nlohmann::json::array();
-	if (args.is_discarded() || !args.is_array() || args.size() != m->params.size()) return -1;
-	std::vector<ReflectValue> rv(m->params.size());
-	for (size_t i = 0; i < m->params.size(); ++i)
-		if (!JsonToRv(args[i], m->params[i], rv[i])) return -1;
-	ReflectValue ret;
-	if (!Reflect_ObjectInvoke((unsigned long)objId, method, rv.data(), rv.size(), ret)) return -1;
-	std::string js = RvToJson(ret);
-	return js.empty() ? 0 : PutStr(js, outJson, cap);
+	return InvokeOnce([&](std::string& out) -> bool {
+		if (!method) return false;
+		TypeInfo* ti = Registry_Find(Reflect_ObjectType((unsigned long)objId));
+		if (!ti) return false;
+		const Method* m = Reflect_FindMethod(ti, method);
+		if (!m) return false;
+		nlohmann::json args = argsJson && *argsJson ? nlohmann::json::parse(argsJson, nullptr, false)
+		                                            : nlohmann::json::array();
+		if (args.is_discarded() || !args.is_array() || args.size() != m->params.size()) return false;
+		std::vector<ReflectValue> rv(m->params.size());
+		for (size_t i = 0; i < m->params.size(); ++i)
+			if (!JsonToRv(args[i], m->params[i], rv[i])) return false;
+		ReflectValue ret;
+		if (!Reflect_ObjectInvoke((unsigned long)objId, method, rv.data(), rv.size(), ret)) return false;
+		out = RvToJson(ret);
+		return true;
+	}, outJson, cap);
 }
 // A component's OWNED instance as a full object handle (MeshRenderer's material).
 static long long __cdecl NativeComponentObject(long long atomId, long long compId, const char* path)
@@ -453,20 +487,22 @@ static int __cdecl NativeReadContent(const char* rel, char* buf, int cap)
 static int __cdecl NativeStaticInvoke(const char* type, const char* method, const char* argsJson,
                                       char* outJson, int cap)
 {
-	if (!type || !method) return -1;
-	TypeInfo* ti = Registry_Find(type);
-	const Method* m = ti ? Reflect_FindMethod(ti, method) : nullptr;
-	if (!m || !m->isStatic) return -1;
-	nlohmann::json args = argsJson && *argsJson ? nlohmann::json::parse(argsJson, nullptr, false)
-	                                            : nlohmann::json::array();
-	if (args.is_discarded() || !args.is_array() || args.size() != m->params.size()) return -1;
-	std::vector<ReflectValue> rv(m->params.size());
-	for (size_t i = 0; i < m->params.size(); ++i)
-		if (!JsonToRv(args[i], m->params[i], rv[i])) return -1;
-	ReflectValue ret;
-	if (!Reflect_Invoke(nullptr, *m, rv.data(), rv.size(), ret)) return -1;
-	std::string js = RvToJson(ret);
-	return js.empty() ? 0 : PutStr(js, outJson, cap);
+	return InvokeOnce([&](std::string& out) -> bool {
+		if (!type || !method) return false;
+		TypeInfo* ti = Registry_Find(type);
+		const Method* m = ti ? Reflect_FindMethod(ti, method) : nullptr;
+		if (!m || !m->isStatic) return false;
+		nlohmann::json args = argsJson && *argsJson ? nlohmann::json::parse(argsJson, nullptr, false)
+		                                            : nlohmann::json::array();
+		if (args.is_discarded() || !args.is_array() || args.size() != m->params.size()) return false;
+		std::vector<ReflectValue> rv(m->params.size());
+		for (size_t i = 0; i < m->params.size(); ++i)
+			if (!JsonToRv(args[i], m->params[i], rv[i])) return false;
+		ReflectValue ret;
+		if (!Reflect_Invoke(nullptr, *m, rv.data(), rv.size(), ret)) return false;
+		out = RvToJson(ret);
+		return true;
+	}, outJson, cap);
 }
 // Mesh CONTENT: the geometry blob channel (engine-side validation + normal generation).
 static int __cdecl NativeSetMeshGeometry(long long objId, int numVerts, const float* verts,
@@ -487,6 +523,28 @@ static long long __cdecl NativeAtomTransformObject(long long atomId)
 	Atom* a = FindAtom(atomId);
 	return a ? (long long)Reflect_WrapObject(&a->GetTransform(), "Transform") : 0;
 }
+// Reflected [[nuke::func]] methods on the ATOM (TypeOf<Atom>): same shape as NativeInvoke.
+static int __cdecl NativeAtomInvoke(long long atomId, const char* method,
+                                    const char* argsJson, char* outJson, int cap)
+{
+	return InvokeOnce([&](std::string& out) -> bool {
+		Atom* a = FindAtom(atomId);
+		if (!a || !method) return false;
+		TypeInfo* ti = Registry_Find("Atom");
+		const Method* m = ti ? Reflect_FindMethod(ti, method) : nullptr;
+		if (!m) return false;
+		nlohmann::json args = argsJson && *argsJson ? nlohmann::json::parse(argsJson, nullptr, false)
+		                                            : nlohmann::json::array();
+		if (args.is_discarded() || !args.is_array() || args.size() != m->params.size()) return false;
+		std::vector<ReflectValue> rv(m->params.size());
+		for (size_t i = 0; i < m->params.size(); ++i)
+			if (!JsonToRv(args[i], m->params[i], rv[i])) return false;
+		ReflectValue ret;
+		if (!Reflect_Invoke(a, *m, rv.data(), rv.size(), ret)) return false;
+		out = RvToJson(ret);
+		return true;
+	}, outJson, cap);
+}
 
 static NativeApi gApi = { &NativeLog, &NativeGetPosition, &NativeSetPosition,
                           &NativeFindAtom, &NativeGetComponent, &NativeAddComponent,
@@ -498,7 +556,7 @@ static NativeApi gApi = { &NativeLog, &NativeGetPosition, &NativeSetPosition,
                           &NativeObjGet, &NativeObjSet, &NativeObjInvoke,
                           &NativeComponentObject, &NativeSetTexturePixels, &NativeReadContent,
                           &NativeStaticInvoke, &NativeSetMeshGeometry, &NativePlayAudioData,
-                          &NativeAtomTransformObject };
+                          &NativeAtomTransformObject, &NativeAtomInvoke };
 
 // The hosted runtime + resolved bridge entry points.
 static bridge_init_fn    gInit    = nullptr;
@@ -632,6 +690,7 @@ static std::string CsEnumDecl(const std::string& enumName, const std::vector<std
 static std::string GenerateCsWrappers()
 {
 	std::string enumDecls;   // namespace-level enum declarations, emitted after the classes
+	std::set<std::string> emittedEnums;   // enum type names already declared (dedup field vs method enums)
 
 	// Which asset kind ([[nuke::prop(asset="...")]]) maps to which generated class: those
 	// STRING guid fields become typed OBJECT properties — user code assigns objects, never
@@ -676,7 +735,7 @@ static std::string GenerateCsWrappers()
 						if (!f.enumLabels.empty())
 						{
 							const std::string en = tn + P;
-							enumDecls += CsEnumDecl(en, f.enumLabels);
+							if (emittedEnums.insert(en).second) enumDecls += CsEnumDecl(en, f.enumLabels);
 							o += "    public " + en + " " + P + " { get => (" + en + ")(int)(GetNumber(" + n + ") ?? 0); set => Set(" + n + ", (double)(int)value); }\n";
 						}
 						else
@@ -719,6 +778,94 @@ static std::string GenerateCsWrappers()
 			}
 	};
 
+	// Which ObjectRef classes a wrapper can be constructed for: emitted NukeObject-channel
+	// classes only (components other than Transform ride the (atom, comp) channel instead).
+	auto objectClassOk = [&](const std::string& cls) -> bool {
+		if (cls.empty() || reserved(cls)) return false;
+		TypeInfo* t = Registry_Find(cls);
+		if (!t) return false;
+		return !isComponent(t) || cls == "Transform";
+	};
+	// FT (+ class name for ref slots) -> the C# parameter/return type ("" = unsupported).
+	auto csType = [&](FT t, const std::string& cls) -> std::string {
+		switch (t)
+		{
+			case FT::Bool: return "bool"; case FT::Int: return "int";
+			case FT::Float: return "float"; case FT::Double: return "double";
+			case FT::String: return "string"; case FT::Vec3: return "Vector3";
+			case FT::Vec2: return "Vector2"; case FT::Vec4: return "Vector4";
+			case FT::Quat: return "Quaternion"; case FT::Color: return "Color";
+			case FT::AtomRef:   return "Atom";                                        // handwritten bridge class
+			case FT::ObjectRef: return objectClassOk(cls) ? cls : std::string();      // generated wrapper class
+			default: return std::string();
+		}
+	};
+	auto pcls = [](const Method& m, size_t i) -> std::string {
+		return i < m.paramClass.size() ? m.paramClass[i] : std::string();
+	};
+	// A reflected ENUM name behind an Int slot ("" = plain int) -> the generated enum type.
+	auto penum = [](const Method& m, size_t i) -> std::string {
+		return i < m.paramEnum.size() ? m.paramEnum[i] : std::string();
+	};
+	// One method body: signature/boxing/return shared by the instance and static emitters.
+	// `callPrefix` already opens the call ("Call(" / "StaticCall(\"Type\", ") — the body
+	// appends the quoted method name, boxed args and the closing paren.
+	auto emitBody = [&](const Method& m, const std::string& P, bool isStatic,
+	                    const std::string& callPrefix, std::string& o) -> bool {
+		std::string rt = m.ret == FT::Unknown ? "void"
+		               : (m.ret == FT::Int && !m.retEnum.empty()) ? m.retEnum   // enum return
+		               : csType(m.ret, m.retClass);
+		if (rt.empty()) return false;
+		if (m.ret == FT::AtomRef || m.ret == FT::ObjectRef) rt += "?";                // null = miss
+		std::string sig, pass;
+		for (size_t i = 0; i < m.params.size(); ++i)
+		{
+			const std::string en = m.params[i] == FT::Int ? penum(m, i) : std::string();
+			std::string pt = !en.empty() ? en : csType(m.params[i], pcls(m, i));
+			if (pt.empty()) return false;
+			std::string an = "a" + std::to_string(i);
+			if (m.params[i] == FT::AtomRef || m.params[i] == FT::ObjectRef) pt += "?";   // null passes 0
+			sig += std::string(i ? ", " : "") + pt + " " + an;
+			std::string boxed = an;
+			if (!en.empty())              boxed = "(double)(int)" + an;   // enum -> number (JSON expects an int)
+			if (m.params[i] == FT::Vec3)  boxed = "new double[]{" + an + ".X, " + an + ".Y, " + an + ".Z}";
+			if (m.params[i] == FT::Vec2)  boxed = "new double[]{" + an + ".X, " + an + ".Y}";
+			if (m.params[i] == FT::Vec4 || m.params[i] == FT::Quat)
+			                              boxed = "new double[]{" + an + ".X, " + an + ".Y, " + an + ".Z, " + an + ".W}";
+			if (m.params[i] == FT::Color) boxed = "new double[]{" + an + ".R, " + an + ".G, " + an + ".B, " + an + ".A}";
+			if (m.params[i] == FT::AtomRef)   boxed = "(double)(" + an + "?.Id ?? 0)";
+			if (m.params[i] == FT::ObjectRef) boxed = "(double)(" + an + "?.ObjectId ?? 0)";
+			pass += ", " + boxed;
+		}
+		o += "    public " + std::string(isStatic ? "static " : "") + rt + " " + P + "(" + sig + ")\n    {\n";
+		o += "        var r = " + callPrefix + "\"" + m.name + "\"" + pass + ");\n";
+		if (m.ret == FT::Int && !m.retEnum.empty())   // enum return: cast the numeric result
+		{
+			o += "        return (" + m.retEnum + ")(r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) ? (int)d : 0);\n";
+			o += "    }\n";
+			return true;
+		}
+		switch (m.ret)
+		{
+			case FT::Unknown: o += "        _ = r;\n"; break;
+			case FT::Bool:    o += "        return r == \"true\";\n"; break;
+			case FT::Int:     o += "        return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) ? (int)d : 0;\n"; break;
+			case FT::Float:   o += "        return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) ? (float)d : 0;\n"; break;
+			case FT::Double:  o += "        return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : 0;\n"; break;
+			case FT::String:  o += "        try { return r != null ? System.Text.Json.JsonSerializer.Deserialize<string>(r) ?? \"\" : \"\"; } catch { return \"\"; }\n"; break;
+			case FT::Vec3:    o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 3 } ? new Vector3(v[0], v[1], v[2]) : default; } catch { return default; }\n"; break;
+			case FT::Vec2:    o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 2 } ? new Vector2(v[0], v[1]) : default; } catch { return default; }\n"; break;
+			case FT::Quat:    o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 4 } ? new Quaternion(v[0], v[1], v[2], v[3]) : Quaternion.Identity; } catch { return Quaternion.Identity; }\n"; break;
+			case FT::Color:   o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 4 } ? new Color(v[0], v[1], v[2], v[3]) : default; } catch { return default; }\n"; break;
+			case FT::AtomRef: o += "        return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) && d != 0 ? new Atom((long)d) : null;\n"; break;
+			case FT::ObjectRef:
+				o += "        return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) && d != 0 ? new " + m.retClass + "((long)d) : null;\n"; break;
+			default:          o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 4 } ? new Vector4(v[0], v[1], v[2], v[3]) : default; } catch { return default; }\n"; break;
+		}
+		o += "    }\n";
+		return true;
+	};
+
 	// ONE method emission for both worlds (Component.Call and NukeObject.Call match).
 	auto emitMethods = [&](TypeInfo* root, std::string& o, std::set<std::string>& used) {
 		for (TypeInfo* ti = root; ti; ti = Registry_Find(ti->base))
@@ -726,107 +873,19 @@ static std::string GenerateCsWrappers()
 			{
 				std::string P = CsPascal(m.name);
 				if (m.isStatic || !used.insert(P).second) continue;
-				auto csType = [](FT t) -> const char* {
-					switch (t)
-					{
-						case FT::Bool: return "bool"; case FT::Int: return "int";
-						case FT::Float: return "float"; case FT::Double: return "double";
-						case FT::String: return "string"; case FT::Vec3: return "Vector3";
-						case FT::Vec2: return "Vector2"; case FT::Vec4: return "Vector4";
-						case FT::Quat: return "Quaternion"; case FT::Color: return "Color";
-						default: return nullptr;
-					}
-				};
-				bool ok = m.ret == FT::Unknown || csType(m.ret);
-				for (FT pft : m.params) ok &= csType(pft) != nullptr;
-				if (!ok) { used.erase(P); continue; }
-				std::string sig, pass;
-				for (size_t i = 0; i < m.params.size(); ++i)
-				{
-					std::string an = "a" + std::to_string(i);
-					sig += std::string(i ? ", " : "") + csType(m.params[i]) + " " + an;
-					std::string boxed = an;
-					if (m.params[i] == FT::Vec3)  boxed = "new double[]{" + an + ".X, " + an + ".Y, " + an + ".Z}";
-					if (m.params[i] == FT::Vec2)  boxed = "new double[]{" + an + ".X, " + an + ".Y}";
-					if (m.params[i] == FT::Vec4 || m.params[i] == FT::Quat)
-					                              boxed = "new double[]{" + an + ".X, " + an + ".Y, " + an + ".Z, " + an + ".W}";
-					if (m.params[i] == FT::Color) boxed = "new double[]{" + an + ".R, " + an + ".G, " + an + ".B, " + an + ".A}";
-					pass += ", " + boxed;
-				}
-				const char* rt = m.ret == FT::Unknown ? "void" : csType(m.ret);
-				o += "    public " + std::string(rt) + " " + P + "(" + sig + ")\n    {\n";
-				o += "        var r = Call(\"" + m.name + "\"" + pass + ");\n";
-				switch (m.ret)
-				{
-					case FT::Unknown: o += "        _ = r;\n"; break;
-					case FT::Bool:    o += "        return r == \"true\";\n"; break;
-					case FT::Int:     o += "        return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) ? (int)d : 0;\n"; break;
-					case FT::Float:   o += "        return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) ? (float)d : 0;\n"; break;
-					case FT::Double:  o += "        return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : 0;\n"; break;
-					case FT::String:  o += "        try { return r != null ? System.Text.Json.JsonSerializer.Deserialize<string>(r) ?? \"\" : \"\"; } catch { return \"\"; }\n"; break;
-					case FT::Vec3:    o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 3 } ? new Vector3(v[0], v[1], v[2]) : default; } catch { return default; }\n"; break;
-					case FT::Vec2:    o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 2 } ? new Vector2(v[0], v[1]) : default; } catch { return default; }\n"; break;
-					case FT::Quat:    o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 4 } ? new Quaternion(v[0], v[1], v[2], v[3]) : Quaternion.Identity; } catch { return Quaternion.Identity; }\n"; break;
-					case FT::Color:   o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 4 } ? new Color(v[0], v[1], v[2], v[3]) : default; } catch { return default; }\n"; break;
-					default:          o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 4 } ? new Vector4(v[0], v[1], v[2], v[3]) : default; } catch { return default; }\n"; break;
-				}
-				o += "    }\n";
+				if (!emitBody(m, P, false, "Call(", o)) used.erase(P);
 			}
 	};
 
-	// STATIC [[nuke::func]] methods (facades: Audio.Play, Physics.Raycast, DebugDraw.Line,
-	// Time/Gui statics, ...) — same shapes as emitMethods, dispatched by TYPE name.
+	// STATIC [[nuke::func]] methods (facades: Audio.Play, Physics.Raycast, Game.LoadWorld,
+	// DebugDraw.Line, Time/Gui statics, ...) — same body, dispatched by TYPE name.
 	auto emitStatics = [&](TypeInfo* root, std::string& o, std::set<std::string>& used) {
 		for (TypeInfo* ti = root; ti; ti = Registry_Find(ti->base))
 			for (const Method& m : ti->methods)
 			{
 				std::string P = CsPascal(m.name);
 				if (!m.isStatic || !used.insert(P).second) continue;
-				auto csType = [](FT t) -> const char* {
-					switch (t)
-					{
-						case FT::Bool: return "bool"; case FT::Int: return "int";
-						case FT::Float: return "float"; case FT::Double: return "double";
-						case FT::String: return "string"; case FT::Vec3: return "Vector3";
-						case FT::Vec2: return "Vector2"; case FT::Vec4: return "Vector4";
-						case FT::Quat: return "Quaternion"; case FT::Color: return "Color";
-						default: return nullptr;
-					}
-				};
-				bool ok = m.ret == FT::Unknown || csType(m.ret);
-				for (FT pft : m.params) ok &= csType(pft) != nullptr;
-				if (!ok) { used.erase(P); continue; }
-				std::string sig, pass;
-				for (size_t i = 0; i < m.params.size(); ++i)
-				{
-					std::string an = "a" + std::to_string(i);
-					sig += std::string(i ? ", " : "") + csType(m.params[i]) + " " + an;
-					std::string boxed = an;
-					if (m.params[i] == FT::Vec3)  boxed = "new double[]{" + an + ".X, " + an + ".Y, " + an + ".Z}";
-					if (m.params[i] == FT::Vec2)  boxed = "new double[]{" + an + ".X, " + an + ".Y}";
-					if (m.params[i] == FT::Vec4 || m.params[i] == FT::Quat)
-					                              boxed = "new double[]{" + an + ".X, " + an + ".Y, " + an + ".Z, " + an + ".W}";
-					if (m.params[i] == FT::Color) boxed = "new double[]{" + an + ".R, " + an + ".G, " + an + ".B, " + an + ".A}";
-					pass += ", " + boxed;
-				}
-				const char* rt = m.ret == FT::Unknown ? "void" : csType(m.ret);
-				o += "    public static " + std::string(rt) + " " + P + "(" + sig + ")\n    {\n";
-				o += "        var r = StaticCall(\"" + root->name + "\", \"" + m.name + "\"" + pass + ");\n";
-				switch (m.ret)
-				{
-					case FT::Unknown: o += "        _ = r;\n"; break;
-					case FT::Bool:    o += "        return r == \"true\";\n"; break;
-					case FT::Int:     o += "        return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) ? (int)d : 0;\n"; break;
-					case FT::Float:   o += "        return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) ? (float)d : 0;\n"; break;
-					case FT::Double:  o += "        return r != null && double.TryParse(r, System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : 0;\n"; break;
-					case FT::String:  o += "        try { return r != null ? System.Text.Json.JsonSerializer.Deserialize<string>(r) ?? \"\" : \"\"; } catch { return \"\"; }\n"; break;
-					case FT::Vec3:    o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 3 } ? new Vector3(v[0], v[1], v[2]) : default; } catch { return default; }\n"; break;
-					case FT::Vec2:    o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 2 } ? new Vector2(v[0], v[1]) : default; } catch { return default; }\n"; break;
-					case FT::Quat:    o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 4 } ? new Quaternion(v[0], v[1], v[2], v[3]) : Quaternion.Identity; } catch { return Quaternion.Identity; }\n"; break;
-					case FT::Color:   o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 4 } ? new Color(v[0], v[1], v[2], v[3]) : default; } catch { return default; }\n"; break;
-					default:          o += "        try { var v = r != null ? System.Text.Json.JsonSerializer.Deserialize<double[]>(r) : null; return v is { Length: >= 4 } ? new Vector4(v[0], v[1], v[2], v[3]) : default; } catch { return default; }\n"; break;
-				}
-				o += "    }\n";
+				if (!emitBody(m, P, true, "StaticCall(\"" + root->name + "\", ", o)) used.erase(P);
 			}
 	};
 
@@ -869,9 +928,17 @@ static std::string GenerateCsWrappers()
 		o += "    public " + on + "(long objectId) : base(objectId) {}\n";
 		if (ti->create)
 			o += "    public static " + on + "? Create() { long h = CreateHandle(\"" + on + "\"); return h != 0 ? new " + on + "(h) : null; }\n";
-		o += "    public static " + on + "? FromGuid(string guid) { long h = HandleFromGuid(guid); return h != 0 ? new " + on + "(h) : null; }\n";
-		o += "    public static " + on + "? Find(string name) { long h = HandleByName(\"" + on + "\", name); return h != 0 ? new " + on + "(h) : null; }\n";
-		std::set<std::string> used = { on, "Create", "FromGuid", "Find", "Guid", "TypeName", "ObjectId" };
+		// Find/FromGuid are only meaningful for ResDB ASSETS — a facade/singleton (World,
+		// Game, Log, Physics, ...) is never looked up by name/guid, so don't emit dead
+		// factories that would always return null.
+		std::set<std::string> used = { on, "Create", "Guid", "TypeName", "ObjectId" };
+		if (Reflect_IsAssetType(on))
+		{
+			o += "    public static " + on + "? FromGuid(string guid) { long h = HandleFromGuid(guid); return h != 0 ? new " + on + "(h) : null; }\n";
+			o += "    public static " + on + "? Find(string name) { long h = HandleByName(\"" + on + "\", name); return h != 0 ? new " + on + "(h) : null; }\n";
+			used.insert("FromGuid");
+			used.insert("Find");
+		}
 		emitFields(ti, on, o, used);
 		emitMethods(ti, o, used);
 		emitStatics(ti, o, used);
@@ -892,6 +959,13 @@ static std::string GenerateCsWrappers()
 		     "    public static Transform? GetTransform(this Atom a)\n"
 		     "    { long h = a.TransformHandle; return h != 0 ? new Transform(h) : null; }\n"
 		     "}\n\n";
+
+	// Reflected ENUM types used by [[nuke::func]] params/returns (e.g. WindowMode) — declared
+	// once at namespace level, deduped against the field enums above.
+	for (const std::string& en : Reflect_AllEnumNames())
+		if (const std::vector<std::string>* labels = Reflect_EnumLabels(en))
+			if (emittedEnums.insert(en).second)
+				enumDecls += CsEnumDecl(en, *labels);
 
 	o += enumDecls;   // namespace-level enums referenced by the properties above
 	return o;
