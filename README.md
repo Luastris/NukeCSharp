@@ -60,6 +60,55 @@ var rb = GetComponent<Rigidbody>();
 rb?.AddForce(new Vector3(0, 10, 0));       // [[nuke::func]] methods, typed
 ```
 
+### Game & World — load worlds, spawn and destroy atoms
+
+```csharp
+var w = Game.GetWorld();                       // the CURRENT world as an object
+Log(w.Name);
+
+var enemy = w.CreateAtom("Enemy");             // new atom at the world root
+enemy.Tag = "hostile";
+enemy.AddComponent<MeshRenderer>();
+enemy.GetTransform()!.Position = new Vector3(0, 1, 0);
+
+var player = w.Get("Player");                  // whole-tree lookup by name
+enemy.SetParent(player);                       // parenting (null = back to root)
+enemy.Destroy();                               // DEFERRED: removed at end of frame (safe on self)
+
+var boss = Prefabs.Instantiate("Prefabs/Boss.nuprefab");   // spawn a saved subtree
+
+Game.LoadWorld("Worlds/level2.nuworld");       // switch worlds (applied at the frame boundary)
+if (Game.IsPaused()) Game.SetPaused(false);
+Game.Quit();                                   // Player: close; editor: ignored
+```
+
+Atoms also expose `Name`, `Tag`, `Parent`, `AddChild`; World adds `GetById`,
+`Pick(origin, dir)`, `Reparent`, `QueueDestroy`, `SaveToString`/`LoadFromString`, `Clear`.
+
+### Window / video settings
+
+Each setter updates the window config, **persists it** (so the next launch uses it), and
+applies live (in the Player; the editor skips the live change but still saves for the game):
+
+```csharp
+Game.SetResolution(1600, 900);
+Game.SetWindowMode(0);       // 0 windowed, 1 borderless fullscreen, 2 exclusive fullscreen
+Game.SetBorderless(true);    // windowed decoration off
+Game.SetOpacity(0.9);        // whole-window 0..1 (live)
+Game.SetTransparent(true);   // per-pixel alpha (takes effect on next launch)
+int w = Game.WindowWidth(); int m = Game.WindowMode();   // + WindowHeight/IsBorderless/Opacity
+```
+
+### Utilities
+
+```csharp
+NukeEngine.Log.Info("mygame", "checkpoint");   // editor Console (also .Warn/.Error);
+                                               // qualify it inside an Electron — the base
+                                               // class has a Log(text) METHOD of its own
+var c = Clock.Create();                        // pausable monotonic stopwatch
+c.Pause(); c.Resume(); double s = c.Elapsed();
+```
+
 ### The object model — every Model class is first-class
 
 ```csharp
