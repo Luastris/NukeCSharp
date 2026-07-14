@@ -157,7 +157,7 @@ static void __cdecl NativeLog(const char* utf8)
 static Atom* FindAtom(long long id)
 {
 	AppInstance* app = AppInstance::GetSingleton();
-	return (app && app->currentScene) ? app->currentScene->GetById((long)id) : nullptr;
+	return (app && app->currentWorld) ? app->currentWorld->GetById((long)id) : nullptr;
 }
 static void __cdecl NativeGetPosition(long long atomId, double* xyz)
 {
@@ -267,8 +267,8 @@ static int InvokeOnce(Exec exec, char* outJson, int cap)
 static long long __cdecl NativeFindAtom(const char* name)
 {
 	AppInstance* app = AppInstance::GetSingleton();
-	if (!app || !app->currentScene || !name) return 0;
-	Atom* a = app->currentScene->Get(name);
+	if (!app || !app->currentWorld || !name) return 0;
+	Atom* a = app->currentWorld->Get(name);
 	return a ? (long long)a->id.id : 0;
 }
 static long long __cdecl NativeGetComponent(long long atomId, const char* type)
