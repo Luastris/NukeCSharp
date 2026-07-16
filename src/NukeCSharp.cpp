@@ -87,6 +87,8 @@ typedef void  (*bridge_update_fn)(void* handle, double dt);
 typedef int   (*bridge_list_fn)(void* buf, int cap);
 typedef int   (*bridge_getprops_fn)(const char* classNameUtf8, void* buf, int cap);
 typedef void  (*bridge_setprop_fn)(void* handle, const char* nameUtf8, const char* valueJsonUtf8);
+typedef void  (*bridge_event_fn)(void* handle, const char* nameUtf8, const char* payloadUtf8);
+typedef int   (*bridge_liveprops_fn)(void* handle, void* buf, int cap);   // -1 = SaveMode.None
 
 // Managed -> native function table. LAYOUT MUST MATCH Bridge.cs NativeApi exactly.
 // Extend ONLY by appending (both sides in the same change). The generic entries ride the
@@ -569,6 +571,8 @@ static bridge_update_fn  gUpdate  = nullptr;
 static bridge_list_fn    gList    = nullptr;
 static bridge_getprops_fn gGetProps = nullptr;
 static bridge_setprop_fn  gSetProp  = nullptr;
+static bridge_event_fn    gEvent    = nullptr;   // nuke::Events delivery (6.3)
+static bridge_liveprops_fn gLive    = nullptr;   // live-state capture on save (6.6)
 static int               gGeneration = 0;      // bumps on every game-assembly (re)load
 static bool              gHostUp = false;
 
@@ -638,6 +642,8 @@ static bool EnsureHost()
 	ok &= resolve(L"ListClasses",        (void**)&gList);
 	ok &= resolve(L"GetClassProps",      (void**)&gGetProps);
 	ok &= resolve(L"SetProp",            (void**)&gSetProp);
+	ok &= resolve(L"CallEvent",          (void**)&gEvent);
+	ok &= resolve(L"GetLiveProps",       (void**)&gLive);
 	if (!ok) return false;
 	if (gInit(&gApi) != 1) { cout << "[NukeCSharp]\tbridge Init failed" << endl; return false; }
 	gHostUp = true;
@@ -1189,8 +1195,8 @@ class CSharpScript : public Component
 {
 	NUKE_CLASS(CSharpScript, Component)
 public:
-	[[nuke::prop]] std::string className;   // full or simple Electron class name
-	[[nuke::prop]] std::string props;       // edited prop values as JSON (hidden; serialized)
+	[[nuke::prop(asset="csclass", label="Class")]] std::string className;   // full or simple Electron class name
+	[[nuke::prop(hidden)]]                         std::string props;       // edited prop values as JSON (serialized)
 
 	void* handle = nullptr;  // managed GCHandle (0 = not created)
 	int   gen    = -1;       // generation the instance was created under (hot reload check)
@@ -1209,6 +1215,9 @@ public:
 	{
 		if (!gHostUp || !gCreate || className.empty()) return;
 		if (handle && gen != gGeneration) { gDestroy(handle); handle = nullptr; failed = false; }   // hot reload
+		// A create that ran BEFORE the game assembly finished loading marks `failed` — a NEW
+		// assembly generation is the retry signal (fixes the boot race; hot reload too).
+		if (!handle && failed && gen != gGeneration) failed = false;
 		if (!handle && !failed)
 		{
 			// Serialized prop overrides land in the fields BEFORE Start (the bridge applies
@@ -1217,7 +1226,35 @@ public:
 			gen = gGeneration;
 			if (!handle) failed = true;   // logged by the bridge
 		}
-		if (handle) gUpdate(handle, Time::getSingleton()->delta);
+		// Scaled GAME delta (Game.SetTimeScale, 6.1): 0 while frozen, ×2/×3 at fast-forward.
+		if (handle) gUpdate(handle, Time::getSingleton()->gameDelta);
+	}
+
+	// Event bus (6.3): forward to the C# instance's OnEvent(string, string) override.
+	// Game thread, game lock held (same contract as the Lua onEvent hook).
+	void OnEvent(const std::string& name, const std::string& payload) override
+	{
+		if (handle && gEvent) gEvent(handle, name.c_str(), payload.c_str());
+	}
+
+	// Savegame v2 (6.6): pull the LIVE public fields back into the serialized props right
+	// before the world saves. The class picks the policy: [Save(SaveMode.All)] default /
+	// Marked ([Save] members only) / None; [DontSave] excludes a member from All. The
+	// capture MERGES over the configured props, so a Marked subset keeps the rest intact.
+	void OnBeforeSave() override
+	{
+		if (!handle || !gLive) return;   // not running — the save keeps the configured values
+		const int need = gLive(handle, nullptr, 0);
+		if (need <= 0) return;           // 0 = error/empty, -1 = SaveMode.None (opted out)
+		std::string live((size_t)need, ' ');
+		gLive(handle, &live[0], need);
+		nlohmann::json cur = props.empty() ? nlohmann::json::object()
+		                                   : nlohmann::json::parse(props, nullptr, false);
+		if (!cur.is_object()) cur = nlohmann::json::object();
+		nlohmann::json j = nlohmann::json::parse(live, nullptr, false);
+		if (!j.is_object()) return;
+		for (auto& kv : j.items()) cur[kv.key()] = kv.value();
+		props = cur.dump();
 	}
 
 	void Destroy() override
@@ -1284,21 +1321,9 @@ public:
 	}
 };
 
-static bool RegisterCSharpComponent()
-{
-	TypeInfo& t = TypeOf<CSharpScript>();
-	t.base = "Component";
-	if (t.fields.empty())
-	{
-		t.fields.push_back(MakeField("className", &CSharpScript::className, "csclass", "Class"));
-		Field pf = MakeField("props", &CSharpScript::props);
-		pf.hidden = true;   // serialized, but drawn as typed DynamicProps instead of raw JSON
-		t.fields.push_back(pf);
-	}
-	t.create = []() -> void* { return new CSharpScript(); };
-	cout << "[NukeCSharp]\tCSharpScript registered." << endl;
-	return true;
-}
+// Modular reflection (see NukeScript): nukegen emits the registration into NukeCSharp.gen.inc, #included
+// in-TU below the CSharpScript definition. Registers into the engine's shared registry.
+#include "NukeCSharp.gen.inc"   // defines NukeReflectInit_NukeCSharp()
 
 // ---- the scripting service ----------------------------------------------------------------------
 
@@ -1368,7 +1393,8 @@ public:
 
 	void OnLoad() override
 	{
-		RegisterCSharpComponent();
+		NukeReflectInit_NukeCSharp();   // register this module's reflected components (generated)
+		cout << "[NukeCSharp]\tCSharpScript registered." << endl;
 		nuke::AssetCreator csType;
 		csType.label = "C# Script";
 		csType.ext = ".cs";

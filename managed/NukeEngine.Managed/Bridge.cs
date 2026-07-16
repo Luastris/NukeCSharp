@@ -17,12 +17,36 @@ namespace NukeEngine;
 // engine's own nomenclature (a game object is an Atom — an Electron is the moving part
 // that gives it behaviour). Game classes derive from this; a CSharpScript component
 // instantiates them by class name.
+// What a class's LIVE state contributes to a world save (Phase 6.6). The save captures
+// runtime field values back into the serialized props right before the world serializes:
+//   All    — every public field/property (the default: savegames just work, Unity-style);
+//            exclude individual members with [DontSave].
+//   Marked — only members carrying [Save] (UE-checkbox style, for classes with lots of
+//            derived/transient state);
+//   None   — capture nothing: the save keeps the editor-configured values.
+public enum SaveMode { All, Marked, None }
+
+// On a CLASS: picks the SaveMode. On a FIELD/PROPERTY: marks it for SaveMode.Marked.
+[AttributeUsage(AttributeTargets.Class | AttributeTargets.Field | AttributeTargets.Property)]
+public class SaveAttribute : Attribute
+{
+    public SaveMode Mode;
+    public SaveAttribute(SaveMode mode = SaveMode.All) { Mode = mode; }
+}
+
+// Excludes one member from SaveMode.All capture (Unity's [NonSerialized] counterpart).
+[AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+public class DontSaveAttribute : Attribute {}
+
 public abstract class Electron
 {
     public long AtomId { get; internal set; }
 
     public virtual void Start() {}
     public virtual void Update(double dt) {}
+    // Event bus (nuke::Events): every emitted event reaches every enabled script once per
+    // frame — override and filter by name. Payload is a plain string (JSON by convention).
+    public virtual void OnEvent(string name, string payload) {}
 
     // Engine API. `Atom` is the owning atom (transform, components); any reflected
     // component is reachable by type name — see the Atom/Component classes below.
@@ -827,13 +851,26 @@ public static unsafe class Bridge
                 yield return (p.Name, p.PropertyType, p.GetValue, p.SetValue);
     }
 
+    // SAVE surface: the inspector set PLUS byte[] blobs (savegame payloads a game packs —
+    // inventories, per-pawn state — carried as base64; never shown in the inspector).
+    static bool Savable(Type t) => Editable(t) || t == typeof(byte[]);
+    static IEnumerable<(string name, Type type, Func<object, object?> get, Action<object, object?> set, MemberInfo mi)> SaveMembers(Type t)
+    {
+        foreach (var f in t.GetFields(BindingFlags.Public | BindingFlags.Instance))
+            if (f.DeclaringType != typeof(Electron) && Savable(f.FieldType))
+                yield return (f.Name, f.FieldType, f.GetValue, f.SetValue, f);
+        foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            if (p.DeclaringType != typeof(Electron) && p.CanRead && p.CanWrite && Savable(p.PropertyType))
+                yield return (p.Name, p.PropertyType, p.GetValue, p.SetValue, p);
+    }
+
     static void ApplyProps(Electron obj, string propsJson)
     {
         if (string.IsNullOrWhiteSpace(propsJson)) return;
         try
         {
             using var doc = System.Text.Json.JsonDocument.Parse(propsJson);
-            foreach (var (name, type, _, set) in Members(obj.GetType()))
+            foreach (var (name, type, _, set, _) in SaveMembers(obj.GetType()))
                 if (doc.RootElement.TryGetProperty(name, out var v))
                 {
                     try
@@ -844,11 +881,39 @@ public static unsafe class Bridge
                         else if (type == typeof(long))   set(obj, (long)v.GetDouble());
                         else if (type == typeof(bool))   set(obj, v.GetBoolean());
                         else if (type == typeof(string)) set(obj, v.GetString() ?? "");
+                        else if (type == typeof(byte[])) set(obj, Convert.FromBase64String(v.GetString() ?? ""));
                     }
                     catch {}   // a stale prop of a changed type: skip, keep the default
                 }
         }
         catch (Exception e) { Native.Log("[NukeCSharp] props apply error: " + e.Message); }
+    }
+
+    // LIVE field values of a running instance, filtered by the class's SaveMode (6.6) —
+    // the native side merges the result into the serialized props right before a world
+    // save. Size-query like ListClasses; returns -1 when the class opted out (SaveMode.None).
+    [UnmanagedCallersOnly]
+    public static int GetLiveProps(nint handle, nint buf, int cap)
+    {
+        try
+        {
+            if (handle == 0 || GCHandle.FromIntPtr(handle).Target is not Electron obj) return 0;
+            var t = obj.GetType();
+            var mode = t.GetCustomAttribute<SaveAttribute>()?.Mode ?? SaveMode.All;
+            if (mode == SaveMode.None) return -1;
+            var dict = new Dictionary<string, object?>();
+            foreach (var (name, _, get, _, mi) in SaveMembers(t))
+            {
+                if (mi.GetCustomAttribute<DontSaveAttribute>() != null) continue;
+                if (mode == SaveMode.Marked && mi.GetCustomAttribute<SaveAttribute>() == null) continue;
+                var v = get(obj);
+                dict[name] = v is byte[] ba ? Convert.ToBase64String(ba) : v;
+            }
+            var bytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(dict);
+            if (buf != 0 && cap > 0) Marshal.Copy(bytes, 0, buf, System.Math.Min(cap, bytes.Length));
+            return bytes.Length;
+        }
+        catch (Exception e) { Native.Log("[NukeCSharp] GetLiveProps error: " + e.Message); return 0; }
     }
 
     // JSON object of the class's editable members with their DECLARED DEFAULTS (a plain
@@ -952,5 +1017,18 @@ public static unsafe class Bridge
             if (GCHandle.FromIntPtr(handle).Target is Electron b) b.Update(dt);
         }
         catch (Exception e) { Native.Log("[NukeCSharp] Update error: " + e.Message); }
+    }
+
+    // Event bus (nuke::Events, 6.3): deliver one event to the instance's OnEvent override.
+    [UnmanagedCallersOnly]
+    public static void CallEvent(nint handle, nint nameUtf8, nint payloadUtf8)
+    {
+        if (handle == 0) return;
+        try
+        {
+            if (GCHandle.FromIntPtr(handle).Target is Electron b)
+                b.OnEvent(Marshal.PtrToStringUTF8(nameUtf8) ?? "", Marshal.PtrToStringUTF8(payloadUtf8) ?? "");
+        }
+        catch (Exception e) { Native.Log("[NukeCSharp] OnEvent error: " + e.Message); }
     }
 }

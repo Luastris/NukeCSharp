@@ -11,9 +11,25 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 set(NUKE_ROOT       "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(VCPKG_INSTALLED "$ENV{VCPKG_ROOT}/installed/x64-windows")
 
+# nukegen (modular reflection): generate NukeCSharp.gen.inc registering this module's [[nuke::prop]]
+# components. NukeCSharp.cpp #includes it in-TU + calls NukeReflectInit_NukeCSharp() from OnLoad.
+find_program(NUKE_PYTHON NAMES python python3 REQUIRED)
+set(NUKECSHARP_GEN "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeCSharp.gen.inc")
+add_custom_command(
+    OUTPUT  "${NUKECSHARP_GEN}"
+    COMMAND "${NUKE_PYTHON}" "${NUKE_ROOT}/NukeUtils/nukegen.py"
+            --include NukeCSharp/src --out NukeCSharp/src/NukeCSharp.gen.inc
+            --init NukeReflectInit_NukeCSharp --scan-cpp --no-includes
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeCSharp.cpp" "${NUKE_ROOT}/NukeUtils/nukegen.py"
+    WORKING_DIRECTORY "${NUKE_ROOT}"
+    COMMENT "nukegen: NukeCSharp modular reflection"
+    VERBATIM)
+add_custom_target(NukeCSharpGen DEPENDS "${NUKECSHARP_GEN}")
+
 add_library(NukeCSharp SHARED
     src/NukeCSharp.cpp
 )
+add_dependencies(NukeCSharp NukeCSharpGen)   # generate the reflection .inc before compiling
 
 # C# scripting backend (SHARED "scripting" service — loads beside NukeScript/Lua). Hosts
 # the installed .NET runtime through hostfxr (found at run time, no build-time SDK link);
