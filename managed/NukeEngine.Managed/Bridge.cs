@@ -38,6 +38,9 @@ public class SaveAttribute : Attribute
 [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
 public class DontSaveAttribute : Attribute {}
 
+// (Atom references need no attribute: declare the member AS `Atom` — the inspector draws
+// the picker, saves carry the stable id, the field holds the live atom object.)
+
 public abstract class Electron
 {
     public long AtomId { get; internal set; }
@@ -104,6 +107,12 @@ internal unsafe struct NativeApi
     public delegate* unmanaged[Cdecl]<long, long> atomTransformObject;
     // Reflected [[nuke::func]] methods on the ATOM itself (GetName/SetParent/Destroy/...).
     public delegate* unmanaged[Cdecl]<long, byte*, byte*, byte*, int, int> atomInvoke;
+    // SCRIPT JOBS (6.10): delegates on the ENGINE worker pool (see the Jobs class docs).
+    public delegate* unmanaged[Cdecl]<long, long>           jobsRun;         // jobId -> wait handle
+    public delegate* unmanaged[Cdecl]<long, int>            jobsDone;        // 1 = finished
+    public delegate* unmanaged[Cdecl]<long, void>           jobsWait;        // block + release
+    public delegate* unmanaged[Cdecl]<long, int, int, void> jobsParallelFor; // jobId, count, grain; blocks
+    public delegate* unmanaged[Cdecl]<long, void>           jobsRunOnMain;   // queued to the game thread
 }
 
 internal static unsafe class Native
@@ -331,6 +340,13 @@ internal static unsafe class Native
         if (Api.timeInfo == null) return;
         fixed (double* d = &delta) fixed (double* e = &elapsed) Api.timeInfo(d, e);
     }
+    // Script jobs (6.10) — the engine pool running managed delegates (see Jobs).
+    internal static long JobsRun(long jobId)          => Api.jobsRun == null ? 0 : Api.jobsRun(jobId);
+    internal static bool JobsDone(long handle)        => Api.jobsDone == null || Api.jobsDone(handle) != 0;
+    internal static void JobsWait(long handle)        { if (Api.jobsWait != null) Api.jobsWait(handle); }
+    internal static void JobsParallelFor(long jobId, int count, int grain)
+        { if (Api.jobsParallelFor != null) Api.jobsParallelFor(jobId, count, grain); }
+    internal static void JobsRunOnMain(long jobId)    { if (Api.jobsRunOnMain != null) Api.jobsRunOnMain(jobId); }
 }
 
 // ---- the game-facing API ----------------------------------------------------------------------
@@ -487,6 +503,82 @@ public static class NukeTime
 {
     public static double Delta   { get { Native.TimeInfo(out var d, out _); return d; } }
     public static double Elapsed { get { Native.TimeInfo(out _, out var e); return e; } }
+}
+
+// Completion handle of a Jobs.Run job. Poll Done or block on Wait; both release the
+// native handle (further polls just read "finished").
+public readonly struct JobHandle
+{
+    internal readonly long Id;
+    internal JobHandle(long id) { Id = id; }
+    public bool Done  => Id == 0 || Native.JobsDone(Id);
+    public void Wait() { if (Id != 0) Native.JobsWait(Id); }
+}
+
+// SCRIPT JOBS (roadmap 6.10): your delegates on the ENGINE's worker pool — the same pool
+// the renderer, physics solver and importers share, one worker per free core.
+//
+// THE RULE: workers compute over PLAIN DATA (your arrays, your numbers). Engine and world
+// mutations (atoms, components, assets, GPU content) happen ONLY on the game thread — do
+// them inside Jobs.RunOnMain(...) or outside of jobs entirely. Engine calls from a worker
+// are not checked and will race the frame.
+public static class Jobs
+{
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<long, Delegate> _table = new();
+    static long _next;
+
+    static long Store(Delegate d)
+    {
+        long id = System.Threading.Interlocked.Increment(ref _next);
+        _table[id] = d;
+        return id;
+    }
+
+    // Queue an action on the pool. Keep the handle to Wait()/poll Done.
+    public static JobHandle Run(Action fn)
+    {
+        long id = Store(fn);
+        long h = Native.JobsRun(id);
+        if (h == 0) _table.TryRemove(id, out _);   // pool unavailable — action never runs
+        return new JobHandle(h);
+    }
+
+    // Data-parallel [0, count): the body fans out across the workers in chunks (one managed
+    // transition per chunk) AND the calling thread crunches too. BLOCKS until every index ran.
+    // grain 0 = auto (~4 chunks per worker).
+    public static void ParallelFor(int count, Action<int> body, int grain = 0)
+    {
+        if (count <= 0) return;
+        long id = Store(body);
+        try     { Native.JobsParallelFor(id, count, grain); }
+        finally { _table.TryRemove(id, out _); }
+    }
+
+    // Post an action to the MAIN/game thread (runs at the next frame pump) — the delivery
+    // channel for worker results into engine state.
+    public static void RunOnMain(Action fn) => Native.JobsRunOnMain(Store(fn));
+
+    // ---- pool -> managed dispatch (called by the bridge exports) ----------------------
+    internal static int Execute(long jobId)
+    {
+        if (!_table.TryRemove(jobId, out var d)) return 0;   // unloaded/stale — skip quietly
+        try { ((Action)d)(); return 1; }
+        catch (Exception e) { Native.Log("[NukeCSharp] job failed: " + e); return 0; }
+    }
+    internal static int ExecuteRange(long jobId, int begin, int end)
+    {
+        if (!_table.TryGetValue(jobId, out var d)) return 0;   // NOT removed — other chunks share it
+        try
+        {
+            var body = (Action<int>)d;
+            for (int i = begin; i < end; ++i) body(i);
+            return 1;
+        }
+        catch (Exception e) { Native.Log("[NukeCSharp] ParallelFor body failed: " + e); return 0; }
+    }
+    // Hot reload: pending delegates from the dying ALC must not keep it alive (native-side
+    // jobs that still reference these ids become quiet no-ops).
+    internal static void Clear() => _table.Clear();
 }
 
 // A live atom of the current world, held by STALE-SAFE id (resolved on every access —
@@ -807,8 +899,17 @@ public static unsafe class Bridge
     [UnmanagedCallersOnly]
     public static void UnloadGameAssembly() => UnloadInternal();
 
+    // Script jobs (6.10): the engine pool enters managed here from its WORKER threads
+    // (CoreCLR attaches them automatically). Return 1 = the delegate ran.
+    [UnmanagedCallersOnly]
+    public static int RunJob(long jobId) => Jobs.Execute(jobId);
+
+    [UnmanagedCallersOnly]
+    public static int RunJobRange(long jobId, int begin, int end) => Jobs.ExecuteRange(jobId, begin, end);
+
     static void UnloadInternal()
     {
+        Jobs.Clear();   // delegates from the dying ALC must not keep it alive
         _games.Clear();
         if (_alc != null)
         {
@@ -838,7 +939,13 @@ public static unsafe class Bridge
 
     static bool Editable(Type t) =>
         t == typeof(float) || t == typeof(double) || t == typeof(int) || t == typeof(long)
-        || t == typeof(bool) || t == typeof(string);
+        || t == typeof(bool) || t == typeof(string)
+        || t == typeof(Atom);   // atom REFERENCE: picker in the inspector, stable id in saves
+
+    // Atom-ref members travel as { "__atomref": <stable id> } in every props JSON.
+    static object? AtomToJsonValue(object? v)
+        => v is Atom a ? new Dictionary<string, long> { { "__atomref", a.Id } }
+                       : new Dictionary<string, long> { { "__atomref", 0 } };
 
     // Every editable member the class DECLARES (base Electron plumbing excluded).
     static IEnumerable<(string name, Type type, Func<object, object?> get, Action<object, object?> set)> Members(Type t)
@@ -882,6 +989,12 @@ public static unsafe class Bridge
                         else if (type == typeof(bool))   set(obj, v.GetBoolean());
                         else if (type == typeof(string)) set(obj, v.GetString() ?? "");
                         else if (type == typeof(byte[])) set(obj, Convert.FromBase64String(v.GetString() ?? ""));
+                        else if (type == typeof(Atom))   // reference by stable id (0 = none)
+                        {
+                            long id = v.ValueKind == System.Text.Json.JsonValueKind.Object
+                                      && v.TryGetProperty("__atomref", out var r) ? r.GetInt64() : 0;
+                            set(obj, id != 0 ? new Atom(id) : null);
+                        }
                     }
                     catch {}   // a stale prop of a changed type: skip, keep the default
                 }
@@ -902,12 +1015,14 @@ public static unsafe class Bridge
             var mode = t.GetCustomAttribute<SaveAttribute>()?.Mode ?? SaveMode.All;
             if (mode == SaveMode.None) return -1;
             var dict = new Dictionary<string, object?>();
-            foreach (var (name, _, get, _, mi) in SaveMembers(t))
+            foreach (var (name, type, get, _, mi) in SaveMembers(t))
             {
                 if (mi.GetCustomAttribute<DontSaveAttribute>() != null) continue;
                 if (mode == SaveMode.Marked && mi.GetCustomAttribute<SaveAttribute>() == null) continue;
                 var v = get(obj);
-                dict[name] = v is byte[] ba ? Convert.ToBase64String(ba) : v;
+                dict[name] = v is byte[] ba          ? Convert.ToBase64String(ba)
+                           : type == typeof(Atom)    ? AtomToJsonValue(v)   // reference by stable id (null -> 0)
+                           : v;
             }
             var bytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(dict);
             if (buf != 0 && cap > 0) Marshal.Copy(bytes, 0, buf, System.Math.Min(cap, bytes.Length));
@@ -928,7 +1043,8 @@ public static unsafe class Bridge
             if (t == null) return 0;
             var tmpl = (Electron)Activator.CreateInstance(t)!;   // defaults only — no Start
             var dict = new Dictionary<string, object?>();
-            foreach (var (name, _, get, _) in Members(t)) dict[name] = get(tmpl);
+            foreach (var (name, type, get, _) in Members(t))
+                dict[name] = type == typeof(Atom) ? AtomToJsonValue(get(tmpl)) : get(tmpl);
             var bytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(dict);
             if (buf != 0 && cap > 0) Marshal.Copy(bytes, 0, buf, System.Math.Min(cap, bytes.Length));
             return bytes.Length;

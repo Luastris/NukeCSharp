@@ -36,6 +36,9 @@
 #include <API/Model/AnimClip.h>
 #include <API/Model/Audio.h>           // sound content: PlayData blob channel
 #include <API/Model/Mesh.h>
+#include <API/Model/Jobs.h>            // script jobs (6.10): managed delegates on the engine pool
+#include <mutex>
+#include <unordered_map>
 
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
@@ -150,6 +153,16 @@ struct NativeApi
 	// against TypeOf<Atom> (atoms travel as stable ids, never object handles).
 	int  (__cdecl* atomInvoke)(long long atomId, const char* method, const char* argsJson,
 	                           char* outJson, int cap);                      // ret len (0 = void), -1 = fail
+	// SCRIPT JOBS (6.10): managed delegates on the ENGINE worker pool. The delegate lives
+	// in the bridge's table under jobId; the pool calls BACK through the bridge exports
+	// (RunJob / RunJobRange) — CoreCLR attaches worker threads on entry. THE RULE (bridge
+	// docs): workers compute over plain data; engine/world mutations only via RunOnMain
+	// or from the main thread.
+	long long (__cdecl* jobsRun)(long long jobId);                    // -> wait handle (0 = fail)
+	int  (__cdecl* jobsDone)(long long handle);                       // 1 = finished (handle released)
+	void (__cdecl* jobsWait)(long long handle);                       // block until finished + release
+	void (__cdecl* jobsParallelFor)(long long jobId, int count, int grain);   // blocks; range calls
+	void (__cdecl* jobsRunOnMain)(long long jobId);                   // queued to the game thread
 };
 
 static void __cdecl NativeLog(const char* utf8)
@@ -548,6 +561,78 @@ static int __cdecl NativeAtomInvoke(long long atomId, const char* method,
 	}, outJson, cap);
 }
 
+// ---- script jobs (6.10): the engine pool running managed delegates ----------------------------
+// Callbacks INTO the bridge (resolved with the other exports): execute the delegate stored
+// under jobId. RunJobRange loops the body over [begin, end) in ONE managed transition —
+// per-index interop would dominate cheap bodies.
+typedef int (*bridge_runjob_fn)(long long jobId);
+typedef int (*bridge_runjobrange_fn)(long long jobId, int begin, int end);
+static bridge_runjob_fn      gRunJob      = nullptr;
+static bridge_runjobrange_fn gRunJobRange = nullptr;
+
+// Wait/Done handles: JobHandle is a C++ object — C# holds an id into this table.
+// Released on Wait() or on the first Done()==true poll (a lookup miss reads as done).
+static std::mutex gJobsMx;
+static std::unordered_map<long long, nuke::JobHandle> gJobHandles;
+static long long gJobsNext = 1;
+
+static long long __cdecl NativeJobsRun(long long jobId)
+{
+	if (!gRunJob) return 0;
+	nuke::JobHandle h = nuke::Jobs::Schedule([jobId] { if (gRunJob) gRunJob(jobId); });
+	std::lock_guard<std::mutex> lk(gJobsMx);
+	const long long id = gJobsNext++;
+	gJobHandles[id] = h;
+	return id;
+}
+static int __cdecl NativeJobsDone(long long handle)
+{
+	std::lock_guard<std::mutex> lk(gJobsMx);
+	auto it = gJobHandles.find(handle);
+	if (it == gJobHandles.end()) return 1;   // released earlier = finished
+	if (!it->second.Done()) return 0;
+	gJobHandles.erase(it);
+	return 1;
+}
+static void __cdecl NativeJobsWait(long long handle)
+{
+	nuke::JobHandle h;
+	{
+		std::lock_guard<std::mutex> lk(gJobsMx);
+		auto it = gJobHandles.find(handle);
+		if (it == gJobHandles.end()) return;
+		h = it->second;               // copy out — never block the table lock on a job
+		gJobHandles.erase(it);
+	}
+	h.Wait();
+}
+static void __cdecl NativeJobsParallelFor(long long jobId, int count, int grain)
+{
+	if (!gRunJobRange || count <= 0) return;
+	if (grain <= 0)
+	{
+		// ~4 chunks per worker: enough slices for load balance, few enough that the
+		// managed transition per chunk stays noise.
+		const int lanes = nuke::Jobs::WorkerCount() + 1;
+		grain = (count + lanes * 4 - 1) / (lanes * 4);
+		if (grain < 1) grain = 1;
+	}
+	// Fan out CHUNK indices through the engine's ParallelFor — it already spreads chunks
+	// across the workers AND crunches on the calling thread (nested calls can't deadlock).
+	const int g = grain, n = count;
+	const int chunks = (n + g - 1) / g;
+	nuke::Jobs::ParallelFor(0, chunks, 1, [jobId, g, n](int c)
+	{
+		const int b = c * g;
+		const int e = (b + g < n) ? b + g : n;
+		if (gRunJobRange) gRunJobRange(jobId, b, e);
+	});
+}
+static void __cdecl NativeJobsRunOnMain(long long jobId)
+{
+	nuke::Jobs::RunOnMain([jobId] { if (gRunJob) gRunJob(jobId); });
+}
+
 static NativeApi gApi = { &NativeLog, &NativeGetPosition, &NativeSetPosition,
                           &NativeFindAtom, &NativeGetComponent, &NativeAddComponent,
                           &NativeGetProp, &NativeSetProp, &NativeInvoke,
@@ -558,7 +643,9 @@ static NativeApi gApi = { &NativeLog, &NativeGetPosition, &NativeSetPosition,
                           &NativeObjGet, &NativeObjSet, &NativeObjInvoke,
                           &NativeComponentObject, &NativeSetTexturePixels, &NativeReadContent,
                           &NativeStaticInvoke, &NativeSetMeshGeometry, &NativePlayAudioData,
-                          &NativeAtomTransformObject, &NativeAtomInvoke };
+                          &NativeAtomTransformObject, &NativeAtomInvoke,
+                          &NativeJobsRun, &NativeJobsDone, &NativeJobsWait,
+                          &NativeJobsParallelFor, &NativeJobsRunOnMain };
 
 // The hosted runtime + resolved bridge entry points.
 static bridge_init_fn    gInit    = nullptr;
@@ -644,6 +731,8 @@ static bool EnsureHost()
 	ok &= resolve(L"SetProp",            (void**)&gSetProp);
 	ok &= resolve(L"CallEvent",          (void**)&gEvent);
 	ok &= resolve(L"GetLiveProps",       (void**)&gLive);
+	ok &= resolve(L"RunJob",             (void**)&gRunJob);       // script jobs (6.10)
+	ok &= resolve(L"RunJobRange",        (void**)&gRunJobRange);
 	if (!ok) return false;
 	if (gInit(&gApi) != 1) { cout << "[NukeCSharp]\tbridge Init failed" << endl; return false; }
 	gHostUp = true;
@@ -1286,13 +1375,19 @@ public:
 		if (edited.is_discarded()) edited = nlohmann::json::object();
 		auto toVar = [](const nlohmann::json& v) {
 			NukeVar r;
-			if      (v.is_number())  { r.kind = NukeVar::Kind::Number; r.num = v.get<double>(); }
+			if (v.is_object() && v.contains("__atomref"))      // atom REFERENCE by stable id
+			{
+				r.kind = NukeVar::Kind::AtomRef;
+				r.refId = v["__atomref"].is_number() ? v["__atomref"].get<long long>() : 0;
+			}
+			else if (v.is_number())  { r.kind = NukeVar::Kind::Number; r.num = v.get<double>(); }
 			else if (v.is_boolean()) { r.kind = NukeVar::Kind::Bool;   r.b   = v.get<bool>(); }
 			else if (v.is_string())  { r.kind = NukeVar::Kind::String; r.str = v.get<std::string>(); }
 			return r;
 		};
 		for (auto it = defs.begin(); it != defs.end(); ++it)
 		{
+			if (it.key().rfind("__", 0) == 0) continue;        // meta keys are not props
 			DynProp d;
 			d.name = it.key();
 			d.def  = toVar(it.value());
@@ -1310,9 +1405,10 @@ public:
 		                                      : nlohmann::json::parse(props, nullptr, false);
 		if (edited.is_discarded() || !edited.is_object()) edited = nlohmann::json::object();
 		nlohmann::json jv;
-		if      (v.kind == NukeVar::Kind::Number) jv = v.num;
-		else if (v.kind == NukeVar::Kind::Bool)   jv = v.b;
-		else if (v.kind == NukeVar::Kind::String) jv = v.str;
+		if      (v.kind == NukeVar::Kind::Number)  jv = v.num;
+		else if (v.kind == NukeVar::Kind::Bool)    jv = v.b;
+		else if (v.kind == NukeVar::Kind::String)  jv = v.str;
+		else if (v.kind == NukeVar::Kind::AtomRef) jv = { { "__atomref", v.refId } };
 		else return;
 		edited[name] = jv;
 		props = edited.dump();
