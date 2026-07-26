@@ -10,6 +10,7 @@ bool NukeReflectInit_NukeCSharp() {
 	{
 		TypeInfo& t = TypeOf<CSharpScript>();
 		t.base = "Component";
+		t.category = "Scripts";
 		t.fields.push_back(MakeField("className", &CSharpScript::className, "csclass", "Class"));
 		t.fields.push_back(MakeField("props", &CSharpScript::props));
 		t.fields.back().hidden = true;

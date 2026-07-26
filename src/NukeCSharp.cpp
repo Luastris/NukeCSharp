@@ -1282,7 +1282,7 @@ static bool BuildAndLoadGameScripts()
 
 class CSharpScript : public Component
 {
-	NUKE_CLASS(CSharpScript, Component)
+	NUKE_CLASS(CSharpScript, Component, "Scripts")
 public:
 	[[nuke::prop(asset="csclass", label="Class")]] std::string className;   // full or simple Electron class name
 	[[nuke::prop(hidden)]]                         std::string props;       // edited prop values as JSON (serialized)
