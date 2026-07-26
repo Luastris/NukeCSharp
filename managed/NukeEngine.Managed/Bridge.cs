@@ -770,6 +770,14 @@ public class Component   // base of the GENERATED typed wrappers (EngineTypes.g.
         if (js == null || !js.StartsWith('[')) return null;
         try { return System.Text.Json.JsonSerializer.Deserialize<double[]>(js); } catch { return null; }
     }
+    // LIST props (std::vector<std::string>): a JSON string array over the same channel.
+    public string[]? GetStrings(string prop)
+    {
+        var js = Native.GetProp(_atom, _id, prop);
+        if (js == null || !js.StartsWith('[')) return null;
+        try { return System.Text.Json.JsonSerializer.Deserialize<string[]>(js); } catch { return null; }
+    }
+    public bool SetStrings(string prop, string[] v) => Native.SetProp(_atom, _id, prop, System.Text.Json.JsonSerializer.Serialize(v));
     public bool Set(string prop, double v)   => Native.SetProp(_atom, _id, prop, v.ToString(System.Globalization.CultureInfo.InvariantCulture));
     public bool Set(string prop, bool v)     => Native.SetProp(_atom, _id, prop, v ? "true" : "false");
     public bool Set(string prop, string v)   => Native.SetProp(_atom, _id, prop, System.Text.Json.JsonSerializer.Serialize(v));

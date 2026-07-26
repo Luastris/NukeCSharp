@@ -306,7 +306,11 @@ static int __cdecl NativeGetProp(long long atomId, long long compId, const char*
 	if (!c || !name || !c->GetType()) return 0;
 	const Field* f = Reflect_FindField(c->GetType(), name);
 	if (!f) return 0;
-	std::string js = RvToJson(Reflect_GetField(c, *f));
+	// LIST props (std::vector<T>) cannot ride in a ReflectValue -- they cross as JSON arrays
+	// straight from the field (same encoding the serializer uses).
+	const bool isList = f->type == FT::IntList || f->type == FT::FloatList
+	                 || f->type == FT::DoubleList || f->type == FT::StringList;
+	std::string js = isList ? Reflect_GetFieldJson(c, *f) : RvToJson(Reflect_GetField(c, *f));
 	if (js.empty()) return 0;
 	if (outJson && cap > 0) memcpy(outJson, js.data(), (size_t)((int)js.size() < cap ? (int)js.size() : cap));
 	return (int)js.size();
@@ -319,6 +323,14 @@ static int __cdecl NativeSetProp(long long atomId, long long compId, const char*
 	if (!f) return 0;
 	nlohmann::json j = nlohmann::json::parse(valueJson, nullptr, false);
 	if (j.is_discarded()) return 0;
+	if (f->type == FT::IntList || f->type == FT::FloatList
+	 || f->type == FT::DoubleList || f->type == FT::StringList)
+	{
+		// LIST prop: the JSON array replaces the whole vector (ReflectValue can't hold it).
+		if (!j.is_array() || !Reflect_SetFieldJson(c, *f, j.dump())) return 0;
+		Reflect_ComponentFieldChanged(c, *f);
+		return 1;
+	}
 	ReflectValue v;
 	if (!JsonToRv(j, f->type, v)) return 0;
 	if (!Reflect_SetField(c, *f, v)) return 0;
@@ -868,6 +880,14 @@ static std::string GenerateCsWrappers()
 							o += "    public Atom? " + P + " { get => GetAtom(" + n + "); set => Set(" + n + ", (double)(value?.Id ?? 0)); }\n";
 						else { used.erase(P); }
 						break;
+					// LIST props (std::vector<T>): cross the bridge as JSON arrays — numeric
+					// lists surface as double[] (curves, id lists), string lists as string[].
+					case FT::IntList:
+					case FT::FloatList:
+					case FT::DoubleList:
+						o += "    public double[] " + P + " { get => GetVector(" + n + ") ?? System.Array.Empty<double>(); set => Set(" + n + ", value); }\n"; break;
+					case FT::StringList:
+						o += "    public string[] " + P + " { get => GetStrings(" + n + ") ?? System.Array.Empty<string>(); set => SetStrings(" + n + ", value); }\n"; break;
 					default: used.erase(P); break;   // unsupported member type: not exposed
 				}
 			}
