@@ -1,22 +1,15 @@
-// NukeCSharp — the C# scripting backend (hosts the modern .NET/CoreCLR through hostfxr
-// — NOT the legacy Mono runtime, hence the name) (the SECOND "scripting" provider: scripting is a
-// SHARED service, so this loads BESIDE NukeScript/Lua — a game can use both at once).
+// NukeCSharp — the C# scripting backend, hosting .NET/CoreCLR through hostfxr. A second
+// "scripting" provider: the service is SHARED, so this loads beside NukeScript/Lua.
 //
-// Hosting: the installed .NET runtime is loaded through hostfxr (found under
-// %ProgramFiles%\dotnet\host\fxr — no SDK linked at build time); the managed bridge
-// (modules/managed/NukeEngine.Managed.dll, built from managed/NukeEngine.Managed) exposes
-// UnmanagedCallersOnly entry points. GAME scripts are a separate assembly loaded FROM
-// BYTES into a collectible AssemblyLoadContext:
-//   * raw project — the module compiles <content>/**/*.cs via `dotnet build` (a generated
-//     csproj under <project>/managed) and loads the produced GameScripts.dll;
-//   * packed game — the pak ships managed/GameScripts.dll, read via AppInstance bytes
-//     (nothing extracts; the player machine needs only the .NET RUNTIME).
-// Hot reload: the Run loop polls .cs mtimes; a change recompiles + reloads the ALC and
-// bumps a generation counter — live CSharpScript instances recreate on their next Update,
-// so classes keep working through PIE (stop/start just recreates them the same way).
+// The managed bridge (modules/managed/NukeEngine.Managed.dll) exposes UnmanagedCallersOnly
+// entry points. Game scripts are a separate assembly loaded FROM BYTES into a collectible
+// AssemblyLoadContext: a raw project compiles <content>/**/*.cs via `dotnet build`; a packed
+// game reads managed/GameScripts.dll out of the pak.
+// Hot reload: the Run loop polls .cs mtimes, recompiles, reloads the ALC and bumps a
+// generation counter — live CSharpScript instances recreate on their next Update.
 //
-// Script convention: derive from NukeEngine.Electron, override Start()/Update(dt);
-// the CSharpScript component's `className` names the class (full or simple name).
+// Script convention: derive from NukeEngine.Electron, override Start()/Update(dt); the
+// CSharpScript component's `className` names the class (full or simple name).
 
 #include <interface/NUKEEInteface.h>   // NUKEModule + AppInstance
 #include <interface/AssetCreators.h>   // "New C# Script" browser entry
@@ -93,10 +86,8 @@ typedef void  (*bridge_setprop_fn)(void* handle, const char* nameUtf8, const cha
 typedef void  (*bridge_event_fn)(void* handle, const char* nameUtf8, const char* payloadUtf8);
 typedef int   (*bridge_liveprops_fn)(void* handle, void* buf, int cap);   // -1 = SaveMode.None
 
-// Managed -> native function table. LAYOUT MUST MATCH Bridge.cs NativeApi exactly.
-// Extend ONLY by appending (both sides in the same change). The generic entries ride the
-// engine's script-neutral reflection layer (ReflectBind) — the SAME surface Lua binds, so
-// every reflected component/prop/[[nuke::func]] method is reachable with zero per-class code.
+// Managed -> native function table. LAYOUT MUST MATCH Bridge.cs NativeApi exactly, and may
+// be extended ONLY by appending (both sides in the same change).
 struct NativeApi
 {
 	void (__cdecl* log)(const char* utf8);
@@ -114,15 +105,12 @@ struct NativeApi
 	void (__cdecl* getTransform)(long long atomId, double* posEulerScale9);
 	void (__cdecl* setTransform)(long long atomId, const double* posEulerScale9);
 	void (__cdecl* timeInfo)(double* delta, double* elapsed);
-	// Reflected SUB-OBJECTS a component owns (a MeshRenderer's material INSTANCE): the
-	// same JSON prop channel, addressed by the owning component + the sub-object path.
+	// Reflected sub-objects a component owns (e.g. a MeshRenderer's material instance).
 	int  (__cdecl* getObjProp)(long long atomId, long long compId, const char* objPath,
 	                           const char* name, char* outJson, int cap);
 	int  (__cdecl* setObjProp)(long long atomId, long long compId, const char* objPath,
 	                           const char* name, const char* valueJson);
-	// FULL OBJECT MODEL (task #67): every reflected Model class is first-class — create,
-	// look up by NAME (never guids in user code), edit props, call methods, assign.
-	// Handles are engine-owned ids (ReflectBind object table).
+	// Object model: handles are engine-owned ids from the ReflectBind object table.
 	long long (__cdecl* createObject)(const char* type);                     // -> objId (0 = fail)
 	long long (__cdecl* objectFromGuid)(const char* guid);                   // asset guid -> objId
 	long long (__cdecl* findAsset)(const char* type, const char* name);      // by asset/file NAME
@@ -135,8 +123,7 @@ struct NativeApi
 	long long (__cdecl* componentObject)(long long atomId, long long compId, const char* path); // owned instance -> objId
 	int  (__cdecl* setTexturePixels)(long long objId, int w, int h, const unsigned char* rgba, int len);
 	int  (__cdecl* readContent)(const char* rel, char* buf, int cap);        // content bytes (raw or pak)
-	// Reflected STATIC [[nuke::func]] methods (facades: Audio, Physics, DebugDraw, ...) —
-	// the same JSON channel as invoke, addressed by TYPE name instead of an instance.
+	// Reflected static methods: the invoke channel addressed by type name, not an instance.
 	int  (__cdecl* staticInvoke)(const char* type, const char* method, const char* argsJson,
 	                             char* outJson, int cap);                    // ret len (0 = void), -1 = fail
 	// Mesh CONTENT: unindexed triangle list (verts required, normals/uvs optional -> computed/zeroed).
@@ -145,19 +132,13 @@ struct NativeApi
 	// Sound CONTENT: play encoded audio bytes (ogg/wav/mp3/flac) a script composed or read.
 	double (__cdecl* playAudioData)(const unsigned char* bytes, long long len,
 	                                double volume, int loop, int bus);       // voice handle, 0 = fail
-	// The atom's LIVE Transform as a reflected OBJECT handle (0 = dead atom): the full
-	// reflected surface — quaternion rotation, [[nuke::func]] math — not a baked float trio.
+	// The atom's live Transform as a reflected object handle (0 = dead atom).
 	long long (__cdecl* atomTransformObject)(long long atomId);
-	// Reflected [[nuke::func]] methods ON THE ATOM ITSELF (GetName/SetName, GetParent/
-	// SetParent, AddChild, Destroy, ...) — the same JSON channel as invoke, resolved
-	// against TypeOf<Atom> (atoms travel as stable ids, never object handles).
+	// Reflected methods on the Atom itself; atoms travel as stable ids, never object handles.
 	int  (__cdecl* atomInvoke)(long long atomId, const char* method, const char* argsJson,
 	                           char* outJson, int cap);                      // ret len (0 = void), -1 = fail
-	// SCRIPT JOBS (6.10): managed delegates on the ENGINE worker pool. The delegate lives
-	// in the bridge's table under jobId; the pool calls BACK through the bridge exports
-	// (RunJob / RunJobRange) — CoreCLR attaches worker threads on entry. THE RULE (bridge
-	// docs): workers compute over plain data; engine/world mutations only via RunOnMain
-	// or from the main thread.
+	// Script jobs: managed delegates on the engine worker pool, called back through the
+	// bridge exports. Workers compute over plain data — engine/world mutation only via RunOnMain.
 	long long (__cdecl* jobsRun)(long long jobId);                    // -> wait handle (0 = fail)
 	int  (__cdecl* jobsDone)(long long handle);                       // 1 = finished (handle released)
 	void (__cdecl* jobsWait)(long long handle);                       // block until finished + release
@@ -254,11 +235,9 @@ static int PutStr(const std::string& s, char* buf, int cap)
 	if (buf && cap > 0) memcpy(buf, s.data(), (size_t)((int)s.size() < cap ? (int)s.size() : cap));
 	return (int)s.size();
 }
-// The INVOKE channels return through the two-call sized-string protocol (probe the length
-// with a null buffer, then fetch into a buffer). A method must EXECUTE EXACTLY ONCE — the
-// probe runs it and caches the result JSON per thread; the fetch only copies the cache.
-// (Executing on both calls double-fired every non-void method: World.CreateAtom spawned
-// TWO atoms, Audio.Play would play twice. Pure getters keep the plain PutStr path.)
+// The invoke channels use a two-call sized-string protocol (probe with a null buffer, then
+// fetch). The method must EXECUTE EXACTLY ONCE: the probe runs it and caches the result JSON
+// per thread, the fetch only copies that cache. Pure getters keep the plain PutStr path.
 static thread_local std::string tlsInvokeCache;
 static thread_local bool        tlsInvokeCached = false;
 template<class Exec>   // Exec: bool(std::string& outJson) — runs the method, fills the result ("" = void)
@@ -306,8 +285,7 @@ static int __cdecl NativeGetProp(long long atomId, long long compId, const char*
 	if (!c || !name || !c->GetType()) return 0;
 	const Field* f = Reflect_FindField(c->GetType(), name);
 	if (!f) return 0;
-	// LIST props (std::vector<T>) cannot ride in a ReflectValue -- they cross as JSON arrays
-	// straight from the field (same encoding the serializer uses).
+	// LIST props cannot ride in a ReflectValue: they cross as the serializer's JSON arrays.
 	const bool isList = f->type == FT::IntList || f->type == FT::FloatList
 	                 || f->type == FT::DoubleList || f->type == FT::StringList;
 	std::string js = isList ? Reflect_GetFieldJson(c, *f) : RvToJson(Reflect_GetField(c, *f));
@@ -383,8 +361,7 @@ static void __cdecl NativeSetTransform(long long atomId, const double* t9)
 		t.scale.x = t9[6]; t.scale.y = t9[7]; t.scale.z = t9[8];
 	}
 }
-// Sub-object resolution lives in the ENGINE (Reflect_SubObject) — one table for every
-// language; this thin alias keeps the call sites readable.
+// Thin alias over the engine's Reflect_SubObject (one table shared by every language).
 static void* ResolveSubObject(Component* c, const char* path, TypeInfo** ti)
 {
 	return Reflect_SubObject(c, path ? path : "", ti);
@@ -435,8 +412,7 @@ static long long __cdecl NativeObjectFromGuid(const char* guid)
 {
 	return guid ? (long long)Reflect_ObjectFromGuid(guid) : 0;
 }
-// Assets by NAME (case-insensitive) — the engine's shared lookup (internal asset names,
-// then file stems): user code says Find("world") / Find("bricks"), never a guid.
+// Asset lookup by name (case-insensitive: internal asset names first, then file stems).
 static long long __cdecl NativeFindAsset(const char* type, const char* name)
 {
 	return name ? (long long)Reflect_FindAsset(type ? type : "", name) : 0;
@@ -573,17 +549,15 @@ static int __cdecl NativeAtomInvoke(long long atomId, const char* method,
 	}, outJson, cap);
 }
 
-// ---- script jobs (6.10): the engine pool running managed delegates ----------------------------
-// Callbacks INTO the bridge (resolved with the other exports): execute the delegate stored
-// under jobId. RunJobRange loops the body over [begin, end) in ONE managed transition —
-// per-index interop would dominate cheap bodies.
+// Callbacks INTO the bridge: run the delegate stored under jobId. RunJobRange covers
+// [begin, end) in ONE managed transition — per-index interop would dominate cheap bodies.
 typedef int (*bridge_runjob_fn)(long long jobId);
 typedef int (*bridge_runjobrange_fn)(long long jobId, int begin, int end);
 static bridge_runjob_fn      gRunJob      = nullptr;
 static bridge_runjobrange_fn gRunJobRange = nullptr;
 
-// Wait/Done handles: JobHandle is a C++ object — C# holds an id into this table.
-// Released on Wait() or on the first Done()==true poll (a lookup miss reads as done).
+// JobHandle is a C++ object, so C# holds an id into this table. Released on Wait() or the
+// first Done()==true poll — a lookup miss therefore reads as done.
 static std::mutex gJobsMx;
 static std::unordered_map<long long, nuke::JobHandle> gJobHandles;
 static long long gJobsNext = 1;
@@ -623,14 +597,12 @@ static void __cdecl NativeJobsParallelFor(long long jobId, int count, int grain)
 	if (!gRunJobRange || count <= 0) return;
 	if (grain <= 0)
 	{
-		// ~4 chunks per worker: enough slices for load balance, few enough that the
-		// managed transition per chunk stays noise.
+		// ~4 chunks per worker: balances load without paying a managed transition per item.
 		const int lanes = nuke::Jobs::WorkerCount() + 1;
 		grain = (count + lanes * 4 - 1) / (lanes * 4);
 		if (grain < 1) grain = 1;
 	}
-	// Fan out CHUNK indices through the engine's ParallelFor — it already spreads chunks
-	// across the workers AND crunches on the calling thread (nested calls can't deadlock).
+	// Fan out chunk indices through Jobs::ParallelFor; it also crunches on the calling thread.
 	const int g = grain, n = count;
 	const int chunks = (n + g - 1) / g;
 	nuke::Jobs::ParallelFor(0, chunks, 1, [jobId, g, n](int c)
@@ -705,8 +677,7 @@ static bool EnsureHost()
 	auto close = (hostfxr_close_fn)       GetProcAddress(fxr, "hostfxr_close");
 	if (!init || !getd || !close) { cout << "[NukeCSharp]\thostfxr exports missing" << endl; return false; }
 
-	// The bridge ships next to the module: modules/managed/NukeEngine.Managed.dll (+ its
-	// runtimeconfig.json, which names the framework the runtime rolls forward from).
+	// The bridge ships next to the module, with the runtimeconfig.json naming its framework.
 	bfs::path managedDir = bfs::path("modules") / "managed";
 	bfs::path cfg = managedDir / "NukeEngine.Managed.runtimeconfig.json";
 	bfs::path dll = managedDir / "NukeEngine.Managed.dll";
@@ -767,18 +738,16 @@ static std::vector<bfs::path> CollectCs(const bfs::path& contentRoot)
 }
 
 // ---- typed wrapper generation (EngineTypes.g.cs) -----------------------------------------------
-// The reflection registry -> typed C# classes, so game code writes GetComponent<Light>()
-// .Intensity = 7 with full IntelliSense — a C# nukegen: zero hand-written wrappers, plugins'
-// component types included automatically (whatever is loaded when the scripts compile).
+// The reflection registry -> typed C# classes (GetComponent<Light>().Intensity), covering
+// whatever component types are loaded when the scripts compile.
 
 static std::string CsPascal(std::string s)
 {
 	if (!s.empty()) s[0] = (char)toupper((unsigned char)s[0]);
 	return s;
 }
-// [[nuke::prop(enum="A,B,C")]] int fields become REAL C# enums — one per (class, prop),
-// e.g. Light.type -> `public enum LightType { Directional, Point, Spot }`; the property is
-// typed as it. Labels sanitize to identifiers (digit-leading ones get a '_' prefix).
+// Emit a C# enum declaration for a reflected enum-tagged int field, one per (class, prop).
+// Labels are sanitized to identifiers; digit-leading ones get a '_' prefix.
 static std::string CsEnumDecl(const std::string& enumName, const std::vector<std::string>& labels)
 {
 	std::string decl = "public enum " + enumName + "\n{\n";
@@ -799,9 +768,7 @@ static std::string GenerateCsWrappers()
 	std::string enumDecls;   // namespace-level enum declarations, emitted after the classes
 	std::set<std::string> emittedEnums;   // enum type names already declared (dedup field vs method enums)
 
-	// Which asset kind ([[nuke::prop(asset="...")]]) maps to which generated class: those
-	// STRING guid fields become typed OBJECT properties — user code assigns objects, never
-	// guid strings ("material.Shader = Shader.Find(...)"). The raw guid property stays too.
+	// Asset kind -> generated class: those guid string fields also get a typed object property.
 	auto assetClass = [](const std::string& kind) -> const char* {
 		if (kind == "mesh")       return "Mesh";
 		if (kind == "material")   return "Material";
@@ -880,8 +847,7 @@ static std::string GenerateCsWrappers()
 							o += "    public Atom? " + P + " { get => GetAtom(" + n + "); set => Set(" + n + ", (double)(value?.Id ?? 0)); }\n";
 						else { used.erase(P); }
 						break;
-					// LIST props (std::vector<T>): cross the bridge as JSON arrays — numeric
-					// lists surface as double[] (curves, id lists), string lists as string[].
+					// LIST props cross the bridge as JSON arrays: numeric -> double[], string -> string[].
 					case FT::IntList:
 					case FT::FloatList:
 					case FT::DoubleList:
@@ -922,9 +888,8 @@ static std::string GenerateCsWrappers()
 	auto penum = [](const Method& m, size_t i) -> std::string {
 		return i < m.paramEnum.size() ? m.paramEnum[i] : std::string();
 	};
-	// One method body: signature/boxing/return shared by the instance and static emitters.
-	// `callPrefix` already opens the call ("Call(" / "StaticCall(\"Type\", ") — the body
-	// appends the quoted method name, boxed args and the closing paren.
+	// One method body, shared by the instance and static emitters. `callPrefix` must already
+	// open the call ("Call(" / "StaticCall(\"Type\", "); the body appends name, args and ')'.
 	auto emitBody = [&](const Method& m, const std::string& P, bool isStatic,
 	                    const std::string& callPrefix, std::string& o) -> bool {
 		std::string rt = m.ret == FT::Unknown ? "void"
@@ -992,8 +957,7 @@ static std::string GenerateCsWrappers()
 			}
 	};
 
-	// STATIC [[nuke::func]] methods (facades: Audio.Play, Physics.Raycast, Game.LoadWorld,
-	// DebugDraw.Line, Time/Gui statics, ...) — same body, dispatched by TYPE name.
+	// Static reflected methods: same body, dispatched by type name.
 	auto emitStatics = [&](TypeInfo* root, std::string& o, std::set<std::string>& used) {
 		for (TypeInfo* ti = root; ti; ti = Registry_Find(ti->base))
 			for (const Method& m : ti->methods)
@@ -1029,10 +993,8 @@ static std::string GenerateCsWrappers()
 		o += "}\n\n";
 	}
 
-	// 2) Every OTHER reflected class: full standalone citizens (create, find, edit, assign).
-	// Transform derives Component in the engine but is the per-atom SINGLETON reached via
-	// Atom.GetTransform() (never through the component-id channel) — it rides the OBJECT
-	// channel here, quaternion rotation and all.
+	// 2) Every other reflected class. Transform derives Component in the engine but is reached
+	// via Atom.GetTransform(), so it rides the OBJECT channel here, not the component-id one.
 	std::set<std::string> comps;
 	for (const std::string& tn : Reflect_ComponentTypes()) comps.insert(tn);
 	for (TypeInfo* ti : Registry_All())
@@ -1043,9 +1005,7 @@ static std::string GenerateCsWrappers()
 		o += "    public " + on + "(long objectId) : base(objectId) {}\n";
 		if (ti->create)
 			o += "    public static " + on + "? Create() { long h = CreateHandle(\"" + on + "\"); return h != 0 ? new " + on + "(h) : null; }\n";
-		// Find/FromGuid are only meaningful for ResDB ASSETS — a facade/singleton (World,
-		// Game, Log, Physics, ...) is never looked up by name/guid, so don't emit dead
-		// factories that would always return null.
+		// Find/FromGuid only for ResDB assets: on a facade they would always return null.
 		std::set<std::string> used = { on, "Create", "Guid", "TypeName", "ObjectId" };
 		if (Reflect_IsAssetType(on))
 		{
@@ -1067,16 +1027,14 @@ static std::string GenerateCsWrappers()
 		o += "}\n\n";
 	}
 
-	// The atom's Transform as the FULL reflected object (quaternion rotation, reflected
-	// math methods) — an extension because Atom itself lives in the handwritten bridge.
+	// An extension method, because Atom itself lives in the handwritten bridge.
 	if (Registry_Find("Transform") && !reserved("Transform"))
 		o += "public static class AtomTransformExtensions\n{\n"
 		     "    public static Transform? GetTransform(this Atom a)\n"
 		     "    { long h = a.TransformHandle; return h != 0 ? new Transform(h) : null; }\n"
 		     "}\n\n";
 
-	// Reflected ENUM types used by [[nuke::func]] params/returns (e.g. WindowMode) — declared
-	// once at namespace level, deduped against the field enums above.
+	// Enum types used by method params/returns, deduped against the field enums above.
 	for (const std::string& en : Reflect_AllEnumNames())
 		if (const std::vector<std::string>* labels = Reflect_EnumLabels(en))
 			if (emittedEnums.insert(en).second)
@@ -1086,11 +1044,9 @@ static std::string GenerateCsWrappers()
 	return o;
 }
 
-// `dotnet build` of a generated csproj -> <project>/managed/bin/<asmName>.dll.
-// Build OUTPUT lives with the project (it ships in the pak), never extracted elsewhere.
-// `asmName`: "GameScripts" for a dev project; a mounted session compiles its overlay
-// scripts into a SEPARATE assembly (unique per session/mod) that REFERENCES the game's
-// GameScripts.dll (`refGameDll`) — mod scripts extend the game, never replace it.
+// `dotnet build` a generated csproj into <project>/managed/bin/<asmName>.dll.
+// `asmName` is "GameScripts" for a dev project; a session/mod uses its own unique name plus
+// `refGameDll` to reference the game's assembly, so its scripts extend it rather than replace it.
 static bool CompileGameScripts(const bfs::path& projectDir, const std::vector<bfs::path>& sources,
                                bfs::path& outDll, const std::string& asmName = "GameScripts",
                                const bfs::path& refGameDll = bfs::path())
@@ -1100,10 +1056,8 @@ static bool CompileGameScripts(const bfs::path& projectDir, const std::vector<bf
 	bfs::create_directories(managed, ec);
 	bfs::path bridge = bfs::absolute(bfs::path("modules") / "managed" / "NukeEngine.Managed.dll");
 
-	// The typed engine wrappers compile WITH the game scripts (and the csproj lists them,
-	// so the IDE gets the same IntelliSense the compiler sees). A session that references
-	// the game's assembly must NOT recompile the wrappers — they live in GameScripts.dll
-	// already (duplicating them would clash every engine type).
+	// The typed wrappers compile with the game scripts, but a session referencing the game's
+	// assembly must NOT re-emit them: duplicates would clash with every engine type.
 	std::string items;
 	if (refGameDll.empty())
 	{
@@ -1138,9 +1092,7 @@ static bool CompileGameScripts(const bfs::path& projectDir, const std::vector<bf
 
 	std::string cmd = "dotnet build \"" + (managed / "GameScripts.csproj").string()
 	                + "\" -c Release -o \"" + (managed / "bin").string() + "\" --nologo -v q";
-	// Capture the compiler's output: a failed build must NAME its errors in the Console,
-	// not just say "failed" (the classic dead-end was an old-API script erroring silently —
-	// picker empty, "class not found", zero clue why).
+	// Capture the compiler's output so a failed build can name its errors in the Console.
 	SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
 	HANDLE rd = NULL, wr = NULL;
 	CreatePipe(&rd, &wr, &sa, 0);
@@ -1193,8 +1145,7 @@ static bool LoadGameBytes(const std::string& bytes)
 	return true;
 }
 
-// Push assembly BYTES as an ADDITION into the live ALC (mods/session scripts EXTEND the
-// game's assembly — they never replace it).
+// Push assembly BYTES as an ADDITION into the live ALC (extends, never replaces).
 static bool AddGameBytes(const std::string& bytes)
 {
 	if (!gHostUp || !gAdd || bytes.empty()) return false;
@@ -1218,8 +1169,7 @@ static bool BuildAndLoadGameScripts()
 	if (!EnsureHost()) return false;
 	AppInstance* app = AppInstance::GetSingleton();
 
-	// The packed GAME assembly (shipExtras puts it in the pak). Present in the shipped
-	// game and in mounted .nupak/.numod editor sessions; absent in a plain dev project.
+	// The packed game assembly: present in a shipped game or a mounted session, absent in a dev project.
 	std::string gameBytes;
 	const bool packedBase = Package::Read("managed/bin/GameScripts.dll", gameBytes) && !gameBytes.empty();
 
@@ -1250,8 +1200,7 @@ static bool BuildAndLoadGameScripts()
 	cout << "[NukeCSharp]\tC# scripts loaded from the pak" << endl;
 	std::set<std::string> have = { "gamescripts" };
 
-	// 2) The session's OWN scripts (a modder's .cs in the overlay): a SEPARATE assembly
-	// referencing the game's — it ADDS classes, never wipes the native ones.
+	// 2) The session's own scripts: a separate assembly referencing the game's, added to it.
 	if (!cs.empty())
 	{
 		bfs::path proj = content.parent_path();
@@ -1324,31 +1273,26 @@ public:
 	{
 		if (!gHostUp || !gCreate || className.empty()) return;
 		if (handle && gen != gGeneration) { gDestroy(handle); handle = nullptr; failed = false; }   // hot reload
-		// A create that ran BEFORE the game assembly finished loading marks `failed` — a NEW
-		// assembly generation is the retry signal (fixes the boot race; hot reload too).
+		// A new assembly generation is the retry signal for a create that failed at boot.
 		if (!handle && failed && gen != gGeneration) failed = false;
 		if (!handle && !failed)
 		{
-			// Serialized prop overrides land in the fields BEFORE Start (the bridge applies
-			// them right after construction) — Start sees the configured values.
+			// The bridge applies the serialized prop overrides before Start runs.
 			handle = gCreate(className.c_str(), (long long)(atom ? atom->id.id : 0), props.c_str());
 			gen = gGeneration;
 			if (!handle) failed = true;   // logged by the bridge
 		}
-		// Scaled GAME delta (Game.SetTimeScale, 6.1): 0 while frozen, ×2/×3 at fast-forward.
-		if (handle) gUpdate(handle, Time::getSingleton()->gameDelta);
+		if (handle) gUpdate(handle, Time::getSingleton()->gameDelta);   // scaled game delta: 0 while frozen
 	}
 
-	// Event bus (6.3): forward to the C# instance's OnEvent(string, string) override.
-	// Game thread, game lock held (same contract as the Lua onEvent hook).
+	// Forwards to the C# instance's OnEvent(string, string); game thread under the game lock.
 	void OnEvent(const std::string& name, const std::string& payload) override
 	{
 		if (handle && gEvent) gEvent(handle, name.c_str(), payload.c_str());
 	}
 
-	// Savegame v2 (6.6): pull the LIVE public fields back into the serialized props right
-	// before the world saves. The class picks the policy: [Save(SaveMode.All)] default /
-	// Marked ([Save] members only) / None; [DontSave] excludes a member from All. The
+	// Pulls the live public fields back into the serialized props before the world saves.
+	// The class picks the policy with [Save(SaveMode.All|Marked|None)] / [DontSave]; the
 	// capture MERGES over the configured props, so a Marked subset keeps the rest intact.
 	void OnBeforeSave() override
 	{
@@ -1375,11 +1319,8 @@ public:
 	void FixedUpdate() override {}
 	void Pause() override {}
 
-	// ---- reflected props: the class's public fields ARE the inspector props -------------
-	// Defaults come from the CLASS (a template instance on the managed side); the edited
-	// values live in the serialized `props` JSON and overlay them — same model as the Lua
-	// ScriptComponent's exported table.
-
+	// The class's public fields are the inspector props: defaults come from a template
+	// instance on the managed side, the serialized `props` JSON overlays them.
 	std::vector<DynProp> DynamicProps() override
 	{
 		std::vector<DynProp> out;
@@ -1437,8 +1378,7 @@ public:
 	}
 };
 
-// Modular reflection (see NukeScript): nukegen emits the registration into NukeCSharp.gen.inc, #included
-// in-TU below the CSharpScript definition. Registers into the engine's shared registry.
+// Generated registration; must be included IN THIS TU, below the CSharpScript definition.
 #include "NukeCSharp.gen.inc"   // defines NukeReflectInit_NukeCSharp()
 
 // ---- the scripting service ----------------------------------------------------------------------
@@ -1492,12 +1432,8 @@ public:
 		return false;   // .cs SOURCES never ship — the compiled GameScripts.dll does (shipExtras)
 	}
 
-	// What a shipped game needs so C# WORKS in the build (module + scripts + components):
-	//   * the compiled game assembly INTO the pak (packed sessions read it from Package);
-	//   * the managed bridge next to the module (modules/managed) — without it the module
-	//     is inert and every CSharpScript component dies silently.
-	// The .NET runtime itself is NOT bundled — players use their installed runtime
-	// (net8.0 floor, RollForward=LatestMajor), same as the dev machine.
+	// Ships the compiled game assembly into the pak and the managed bridge next to the module
+	// (without the bridge this module is inert). The .NET runtime itself is not bundled.
 	void shipExtras(const char* projectDir, std::vector<std::string>& pakFiles,
 	                std::vector<std::pair<std::string, std::string>>& distFiles) override
 	{
@@ -1509,6 +1445,13 @@ public:
 
 	void OnLoad() override
 	{
+#ifdef _WIN32
+		// PIN this DLL: a hosted CLR never unloads, so an un-pinned FreeLibrary would block
+		// forever in DllMain(PROCESS_DETACH). Pinned, the DLL just dies with the process.
+		HMODULE self = nullptr;
+		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+		                   reinterpret_cast<LPCWSTR>(&NukeReflectInit_NukeCSharp), &self);
+#endif
 		NukeReflectInit_NukeCSharp();   // register this module's reflected components (generated)
 		cout << "[NukeCSharp]\tCSharpScript registered." << endl;
 		nuke::AssetCreator csType;
@@ -1518,8 +1461,7 @@ public:
 		csType.category = "Scripts";
 		csType.textEditable = true;
 		csType.syntaxLanguage = "cpp";   // closest built-in highlighting
-		// %CLASSNAME% follows the FILE name: the editor substitutes it at creation AND
-		// again when the just-created file is renamed (CSharpScript finds classes by name).
+		// %CLASSNAME% follows the file name; the editor substitutes it on create and on rename.
 		csType.content =
 			"using NukeEngine;\n\n"
 			"public class %CLASSNAME% : Electron\n"
@@ -1538,8 +1480,7 @@ public:
 
 	void Run(AppInstance* instance) override
 	{
-		// Host the runtime + build/load the game scripts, then watch .cs files for hot
-		// reload (raw sessions only — a pak is immutable).
+		// Host the runtime, load the scripts, then watch .cs for hot reload (raw sessions only).
 		if (!BuildAndLoadGameScripts())
 		{
 			if (gHostUp) cout << "[NukeCSharp]\tno C# scripts yet — watching for .cs files" << endl;
