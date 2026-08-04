@@ -13,6 +13,7 @@
 
 #include <interface/NUKEEInteface.h>   // NUKEModule + AppInstance
 #include <interface/AssetCreators.h>   // "New C# Script" browser entry
+#include <interface/IconsFileTypes.h>
 #include <service/iScript.h>           // the SHARED scripting service contract
 #include <reflect/Reflect.h>
 #include <reflect/ReflectBind.h>       // generic component/prop/method access for the C# API
@@ -792,6 +793,21 @@ static std::string GenerateCsWrappers()
 		return false;
 	};
 
+	// Public members of the handwritten bases (Component/NukeObject in Bridge.cs). A reflected
+	// prop/method with one of these names HIDES the base member, so the generated accessors must
+	// call the base explicitly (base.GetBool(...)) and the hiding member gets `new` — otherwise
+	// e.g. Animator's [[nuke::func]] GetBool (SM param) shadows Component.GetBool and every
+	// bool prop in that class stops compiling (CS0019 on `?? default`).
+	static const char* kBaseMembers[] = { "GetNumber", "GetBool", "GetString", "GetVector",
+		"GetStrings", "GetVector2", "GetVector3", "GetVector4", "GetQuat", "GetColor", "GetAtom",
+		"Set", "SetStrings", "Call", "StaticCall", "OwnedHandle", "Type", "TypeName", "Guid",
+		"ObjectId", "Enabled" };
+	auto hidesBase = [&](const std::string& P) {
+		for (const char* b : kBaseMembers) if (P == b) return true;
+		return false;
+	};
+	auto newKw = [&](const std::string& P) { return hidesBase(P) ? std::string("new ") : std::string(); };
+
 	// ONE field emission for both worlds (components and objects share the helper names).
 	auto emitFields = [&](TypeInfo* root, const std::string& tn, std::string& o, std::set<std::string>& used) {
 		for (TypeInfo* ti = root; ti; ti = Registry_Find(ti->base))
@@ -801,24 +817,25 @@ static std::string GenerateCsWrappers()
 				std::string P = CsPascal(f.name);
 				if (!used.insert(P).second) continue;
 				const std::string n = "\"" + f.name + "\"";
+				const std::string pub = "    public " + newKw(P);
 				switch (f.type)
 				{
 					case FT::Bool:
-						o += "    public bool " + P + " { get => GetBool(" + n + ") ?? default; set => Set(" + n + ", value); }\n"; break;
+						o += pub + "bool " + P + " { get => base.GetBool(" + n + ") ?? default; set => base.Set(" + n + ", value); }\n"; break;
 					case FT::Int:
 						if (!f.enumLabels.empty())
 						{
 							const std::string en = tn + P;
 							if (emittedEnums.insert(en).second) enumDecls += CsEnumDecl(en, f.enumLabels);
-							o += "    public " + en + " " + P + " { get => (" + en + ")(int)(GetNumber(" + n + ") ?? 0); set => Set(" + n + ", (double)(int)value); }\n";
+							o += pub + en + " " + P + " { get => (" + en + ")(int)(base.GetNumber(" + n + ") ?? 0); set => base.Set(" + n + ", (double)(int)value); }\n";
 						}
 						else
-							o += "    public int " + P + " { get => (int)(GetNumber(" + n + ") ?? 0); set => Set(" + n + ", (double)value); }\n";
+							o += pub + "int " + P + " { get => (int)(base.GetNumber(" + n + ") ?? 0); set => base.Set(" + n + ", (double)value); }\n";
 						break;
 					case FT::Float:
-						o += "    public float " + P + " { get => (float)(GetNumber(" + n + ") ?? 0); set => Set(" + n + ", (double)value); }\n"; break;
+						o += pub + "float " + P + " { get => (float)(base.GetNumber(" + n + ") ?? 0); set => base.Set(" + n + ", (double)value); }\n"; break;
 					case FT::Double:
-						o += "    public double " + P + " { get => GetNumber(" + n + ") ?? 0; set => Set(" + n + ", value); }\n"; break;
+						o += pub + "double " + P + " { get => base.GetNumber(" + n + ") ?? 0; set => base.Set(" + n + ", value); }\n"; break;
 					case FT::String:
 					{
 						// Asset guid field -> a TYPED object property (name = field minus "Guid").
@@ -827,33 +844,33 @@ static std::string GenerateCsWrappers()
 							std::string tp = P;
 							if (tp.size() > 4 && tp.compare(tp.size() - 4, 4, "Guid") == 0) tp = tp.substr(0, tp.size() - 4);
 							if (!used.insert(tp).second) { tp += "Asset"; used.insert(tp); }
-							o += "    public " + std::string(cls) + "? " + tp + " { get { var g = GetString(" + n + ") ?? \"\"; return g.Length == 0 ? null : " + cls + ".FromGuid(g); } set => Set(" + n + ", value?.Guid ?? \"\"); }\n";
+							o += "    public " + newKw(tp) + std::string(cls) + "? " + tp + " { get { var g = base.GetString(" + n + ") ?? \"\"; return g.Length == 0 ? null : " + cls + ".FromGuid(g); } set => base.Set(" + n + ", value?.Guid ?? \"\"); }\n";
 						}
-						o += "    public string " + P + " { get => GetString(" + n + ") ?? \"\"; set => Set(" + n + ", value); }\n";
+						o += pub + "string " + P + " { get => base.GetString(" + n + ") ?? \"\"; set => base.Set(" + n + ", value); }\n";
 						break;
 					}
 					case FT::Vec3:
-						o += "    public Vector3 " + P + " { get => GetVector3(" + n + "); set => Set(" + n + ", value); }\n"; break;
+						o += pub + "Vector3 " + P + " { get => base.GetVector3(" + n + "); set => base.Set(" + n + ", value); }\n"; break;
 					case FT::Vec2:
-						o += "    public Vector2 " + P + " { get => GetVector2(" + n + "); set => Set(" + n + ", value); }\n"; break;
+						o += pub + "Vector2 " + P + " { get => base.GetVector2(" + n + "); set => base.Set(" + n + ", value); }\n"; break;
 					case FT::Vec4:
-						o += "    public Vector4 " + P + " { get => GetVector4(" + n + "); set => Set(" + n + ", value); }\n"; break;
+						o += pub + "Vector4 " + P + " { get => base.GetVector4(" + n + "); set => base.Set(" + n + ", value); }\n"; break;
 					case FT::Quat:
-						o += "    public Quaternion " + P + " { get => GetQuat(" + n + "); set => Set(" + n + ", value); }\n"; break;
+						o += pub + "Quaternion " + P + " { get => base.GetQuat(" + n + "); set => base.Set(" + n + ", value); }\n"; break;
 					case FT::Color:
-						o += "    public Color " + P + " { get => GetColor(" + n + "); set => Set(" + n + ", value); }\n"; break;
+						o += pub + "Color " + P + " { get => base.GetColor(" + n + "); set => base.Set(" + n + ", value); }\n"; break;
 					case FT::AtomRef:
 						if (isComponent(root))
-							o += "    public Atom? " + P + " { get => GetAtom(" + n + "); set => Set(" + n + ", (double)(value?.Id ?? 0)); }\n";
+							o += pub + "Atom? " + P + " { get => base.GetAtom(" + n + "); set => base.Set(" + n + ", (double)(value?.Id ?? 0)); }\n";
 						else { used.erase(P); }
 						break;
 					// LIST props cross the bridge as JSON arrays: numeric -> double[], string -> string[].
 					case FT::IntList:
 					case FT::FloatList:
 					case FT::DoubleList:
-						o += "    public double[] " + P + " { get => GetVector(" + n + ") ?? System.Array.Empty<double>(); set => Set(" + n + ", value); }\n"; break;
+						o += pub + "double[] " + P + " { get => base.GetVector(" + n + ") ?? System.Array.Empty<double>(); set => base.Set(" + n + ", value); }\n"; break;
 					case FT::StringList:
-						o += "    public string[] " + P + " { get => GetStrings(" + n + ") ?? System.Array.Empty<string>(); set => SetStrings(" + n + ", value); }\n"; break;
+						o += pub + "string[] " + P + " { get => base.GetStrings(" + n + ") ?? System.Array.Empty<string>(); set => base.SetStrings(" + n + ", value); }\n"; break;
 					default: used.erase(P); break;   // unsupported member type: not exposed
 				}
 			}
@@ -917,7 +934,7 @@ static std::string GenerateCsWrappers()
 			if (m.params[i] == FT::ObjectRef) boxed = "(double)(" + an + "?.ObjectId ?? 0)";
 			pass += ", " + boxed;
 		}
-		o += "    public " + std::string(isStatic ? "static " : "") + rt + " " + P + "(" + sig + ")\n    {\n";
+		o += "    public " + std::string(isStatic ? "static " : "") + newKw(P) + rt + " " + P + "(" + sig + ")\n    {\n";
 		o += "        var r = " + callPrefix + "\"" + m.name + "\"" + pass + ");\n";
 		if (m.ret == FT::Int && !m.retEnum.empty())   // enum return: cast the numeric result
 		{
@@ -953,7 +970,7 @@ static std::string GenerateCsWrappers()
 			{
 				std::string P = CsPascal(m.name);
 				if (m.isStatic || !used.insert(P).second) continue;
-				if (!emitBody(m, P, false, "Call(", o)) used.erase(P);
+				if (!emitBody(m, P, false, "base.Call(", o)) used.erase(P);
 			}
 	};
 
@@ -973,6 +990,7 @@ static std::string GenerateCsWrappers()
 		"// EVERY reflected Model class is here: components (GetComponent<Light>()) AND\n"
 		"// standalone objects (Material/Texture/Mesh/Shader/AnimClip: Create/Find/FromGuid,\n"
 		"// typed props incl. asset refs as OBJECTS, [[nuke::func]] methods, real enums).\n"
+		"#nullable enable\n"
 		"namespace NukeEngine;\n\n";
 
 	// 1) Components.
@@ -1136,12 +1154,58 @@ static bool CompileGameScripts(const bfs::path& projectDir, const std::vector<bf
 }
 
 // Push assembly BYTES into the bridge (collectible ALC — this IS the (re)load).
+// Publish every loaded Electron class + its public fields into the SHARED reflection registry,
+// so reflection-driven editor UI (animation/sequencer prop pickers) offers script props next to
+// native ones. Re-runs on every (re)load: the registry is cleared for this host component first.
+static void PublishScriptClasses()
+{
+	nuke::Reflect_ClearScriptClasses("CSharpScript");
+	if (!gHostUp || !gList) return;
+	int need = gList(nullptr, 0);
+	if (need <= 0) return;
+	std::string raw((size_t)need, ' ');
+	gList(&raw[0], need);
+	nlohmann::json names = nlohmann::json::parse(raw, nullptr, false);
+	if (names.is_discarded() || !names.is_array()) return;
+	for (const auto& n : names)
+	{
+		if (!n.is_string()) continue;
+		nuke::ScriptClass sc;
+		sc.name = sc.selector = n.get<std::string>();
+		sc.component = "CSharpScript";
+		if (gGetProps)   // defaults double as the prop schema (name -> value kind)
+		{
+			int pn = gGetProps(sc.selector.c_str(), nullptr, 0);
+			if (pn > 0)
+			{
+				std::string praw((size_t)pn, ' ');
+				gGetProps(sc.selector.c_str(), &praw[0], pn);
+				nlohmann::json defs = nlohmann::json::parse(praw, nullptr, false);
+				if (!defs.is_discarded() && defs.is_object())
+					for (auto it = defs.begin(); it != defs.end(); ++it)
+					{
+						if (it.key().rfind("__", 0) == 0) continue;
+						nuke::ScriptProp p;
+						p.name = it.key();
+						if      (it.value().is_number())  p.type = nuke::FT::Double;
+						else if (it.value().is_boolean()) p.type = nuke::FT::Bool;
+						else if (it.value().is_string())  p.type = nuke::FT::String;
+						else continue;
+						sc.props.push_back(p);
+					}
+			}
+		}
+		nuke::Reflect_RegisterScriptClass(sc);
+	}
+}
+
 static bool LoadGameBytes(const std::string& bytes)
 {
 	if (!gHostUp || !gLoad || bytes.empty()) return false;
 	int n = gLoad((void*)bytes.data(), (int)bytes.size());
 	if (n < 0) return false;
 	++gGeneration;   // live instances are stale now — components recreate next Update
+	PublishScriptClasses();
 	return true;
 }
 
@@ -1149,7 +1213,9 @@ static bool LoadGameBytes(const std::string& bytes)
 static bool AddGameBytes(const std::string& bytes)
 {
 	if (!gHostUp || !gAdd || bytes.empty()) return false;
-	return gAdd((void*)bytes.data(), (int)bytes.size()) >= 0;
+	if (gAdd((void*)bytes.data(), (int)bytes.size()) < 0) return false;
+	PublishScriptClasses();   // the session's classes join the shared registry too
+	return true;
 }
 
 // Identifier-safe assembly name for a SESSION's own scripts (unique per session/mod so
@@ -1386,6 +1452,8 @@ public:
 struct CSharpScriptService : public iScript
 {
 	const char* Language() override { return "cs"; }
+	const char* HostComponent() override { return "CSharpScript"; }
+	const char* Icon() override { return ICON_FT_CSHARP; }
 	bool Run(const char* code, const char* chunkName) override
 	{
 		// Snippet eval needs Roslyn scripting — planned; class-based scripts are the v1 path.
@@ -1398,6 +1466,32 @@ struct CSharpScriptService : public iScript
 	int ListClasses(char* buf, int cap) override
 	{
 		return (gHostUp && gList) ? gList(buf, cap) : 0;
+	}
+
+	// The class's public fields, straight off the LOADED assembly (the same source the inspector
+	// props use): "name<TAB>kind" per line, value kind taken from the managed default.
+	int ListClassProps(const char* cls, char* buf, int cap) override
+	{
+		if (!gHostUp || !gGetProps || !cls || !*cls) return 0;
+		int need = gGetProps(cls, nullptr, 0);
+		if (need <= 0) return 0;
+		std::string raw((size_t)need, ' ');
+		gGetProps(cls, &raw[0], need);
+		nlohmann::json defs = nlohmann::json::parse(raw, nullptr, false);
+		if (defs.is_discarded() || !defs.is_object()) return 0;
+		std::string out;
+		for (auto it = defs.begin(); it != defs.end(); ++it)
+		{
+			if (it.key().rfind("__", 0) == 0) continue;   // meta keys are not props
+			const char* kind = it.value().is_number()  ? "number"
+			                 : it.value().is_boolean() ? "bool"
+			                 : it.value().is_string()  ? "string" : nullptr;
+			if (!kind) continue;                          // atom refs / tables are not keyable
+			out += it.key() + '\t' + kind + '\n';
+		}
+		if (out.empty()) return 0;
+		if (buf && cap >= (int)out.size()) memcpy(buf, out.data(), out.size());
+		return (int)out.size();
 	}
 };
 static CSharpScriptService gMonoService;
@@ -1457,6 +1551,7 @@ public:
 		nuke::AssetCreator csType;
 		csType.label = "C# Script";
 		csType.ext = ".cs";
+		csType.icon = ICON_FT_CSHARP;
 		csType.baseName = "NewElectron";
 		csType.category = "Scripts";
 		csType.textEditable = true;
