@@ -13,14 +13,15 @@ set(VCPKG_INSTALLED "$ENV{VCPKG_ROOT}/installed/x64-windows")
 
 # nukegen (modular reflection): generate NukeCSharp.gen.inc registering this module's [[nuke::prop]]
 # components. NukeCSharp.cpp #includes it in-TU + calls NukeReflectInit_NukeCSharp() from OnLoad.
-find_program(NUKE_PYTHON NAMES python python3 REQUIRED)
+set(NUKE_GEN "${NUKE_ROOT}/NukeUtils/bin/NukeGen.exe")   # built FIRST by the superbuild
 set(NUKECSHARP_GEN "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeCSharp.gen.inc")
 add_custom_command(
     OUTPUT  "${NUKECSHARP_GEN}"
-    COMMAND "${NUKE_PYTHON}" "${NUKE_ROOT}/NukeUtils/nukegen.py"
+    COMMAND "${NUKE_GEN}"
             --include NukeCSharp/src --out NukeCSharp/src/NukeCSharp.gen.inc
             --init NukeReflectInit_NukeCSharp --scan-cpp --no-includes
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeCSharp.cpp" "${NUKE_ROOT}/NukeUtils/nukegen.py"
+            --sdk "${NUKE_ROOT}/NukeUtils/sdk/nukesdk/NukeCSharp.sdk.h" --doc "${NUKE_ROOT}/NukeUtils/sdkdocs/NukeCSharp.md"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeCSharp.cpp" "${NUKE_GEN}"
     WORKING_DIRECTORY "${NUKE_ROOT}"
     COMMENT "nukegen: NukeCSharp modular reflection"
     VERBATIM)
