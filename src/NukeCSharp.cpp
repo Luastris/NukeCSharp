@@ -15,6 +15,7 @@
 #include <interface/AssetCreators.h>   // "New C# Script" browser entry
 #include <interface/IconsFileTypes.h>
 #include <service/iScript.h>           // the SHARED scripting service contract
+#include <interface/Modular.h>         // PluginOwnedTypes: which classes came from which plugin
 #include <reflect/Reflect.h>
 #include <reflect/ReflectBind.h>       // generic component/prop/method access for the C# API
 #include <API/Model/Atom.h>
@@ -1493,6 +1494,147 @@ struct CSharpScriptService : public iScript
 		if (buf && cap >= (int)out.size()) memcpy(buf, out.data(), out.size());
 		return (int)out.size();
 	}
+
+	// Which engine plugins a piece of C# needs. This backend owns both shapes its code ships in:
+	// .cs source, where a plugin class is written out as an identifier, and the compiled assembly,
+	// whose metadata keeps every type and member name NUL-delimited in the strings heap — so an
+	// exact whole-name hit there is a real reference, not a word in a comment.
+	int ModuleDeps(const char* path, char* buf, int cap) override
+	{
+		if (!path) return 0;
+		std::string ext = bfs::path(path).extension().string();
+		for (char& c : ext) c = (char)tolower((unsigned char)c);
+		const bool isSrc = (ext == ".cs");
+		const bool isAsm = (ext == ".dll");
+		if (!isSrc && !isAsm) return 0;                // not ours: nothing was read
+
+		bfs::ifstream f(bfs::path(path), std::ios::binary);
+		if (!f) return 0;
+		std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+		f.close();
+		if (data.empty()) return 0;
+		if (isSrc)
+			// Line comments out: a class named in prose is not a dependency.
+			for (size_t i = 0; i + 1 < data.size(); ++i)
+				if (data[i] == '/' && data[i + 1] == '/')
+					while (i < data.size() && data[i] != '\n') data[i++] = ' ';
+		else
+		{
+			bool dummy = false;
+			if (HasPInvoke(data, dummy) <= 0) return 0;   // a native DLL is not this backend's
+		}
+		auto ident = [](char c) { return isalnum((unsigned char)c) != 0 || c == '_'; };
+		std::set<std::string> mods;
+		for (const auto& t : nuke::PluginOwnedTypes())
+		{
+			bool hit = false;
+			if (isAsm)
+				hit = data.find(std::string(1, '\0') + t.first + '\0') != std::string::npos;
+			else
+				for (size_t p = data.find(t.first); p != std::string::npos && !hit; p = data.find(t.first, p + 1))
+				{
+					const size_t e = p + t.first.size();
+					hit = (p == 0 || !ident(data[p - 1])) && (e >= data.size() || !ident(data[e]));
+				}
+			if (hit) mods.insert(t.second);
+		}
+		std::string out;
+		for (const std::string& m : mods) out += m + '\n';
+		if (out.empty()) return 0;
+		if (buf && cap >= (int)out.size()) memcpy(buf, out.data(), out.size());
+		return (int)out.size();
+	}
+
+	// Is this piece of C# tied to one platform? IL is not — it runs on whatever .NET is under it.
+	// The exception is code that leaves IL: a P/Invoke binds the assembly to native libraries and
+	// so to an OS. That is readable from the metadata without running anything — the #~ stream
+	// advertises which tables exist, and ImplMap exists only if something is declared extern.
+	// Source is judged by the same idea one step earlier, at the attribute.
+	int PlatformOf(const char* path, char* buf, int cap) override
+	{
+		if (!path) return 0;
+		std::string ext = bfs::path(path).extension().string();
+		for (char& c : ext) c = (char)tolower((unsigned char)c);
+		if (ext != ".cs" && ext != ".dll") return 0;    // not ours: nothing was read
+		bfs::ifstream f(bfs::path(path), std::ios::binary);
+		if (!f) return 0;
+		std::string d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+		f.close();
+		bool native = false;
+		if (ext == ".cs")
+		{
+			// Comments out first: "DllImport" in prose must not bind the package to an OS.
+			for (size_t i = 0; i + 1 < d.size(); ++i)
+				if (d[i] == '/' && d[i + 1] == '/')
+					while (i < d.size() && d[i] != '\n') d[i++] = ' ';
+			native = d.find("DllImport") != std::string::npos;
+		}
+		else if (HasPInvoke(d, native) <= 0)
+			return 0;                                   // not a managed assembly: not ours to judge
+
+		const std::string tag = native ? nuke::Package::CurrentPlatform() : "any";
+		if (buf && cap >= (int)tag.size()) memcpy(buf, tag.data(), tag.size());
+		return (int)tag.size();
+	}
+
+private:
+	// Walks a PE's CLI metadata far enough to read the #~ stream's `Valid` table mask. 1 = this
+	// is a managed assembly (and `pinvoke` says whether ImplMap, bit 28, is present), 0 = it is
+	// not one, -1 = malformed. All of this is .NET's file format, so it lives in .NET's module.
+	static int HasPInvoke(const std::string& d, bool& pinvoke)
+	{
+		pinvoke = false;
+		auto u16 = [&](size_t o) -> uint16_t
+		{ return o + 2 <= d.size() ? (uint16_t)((uint8_t)d[o] | ((uint8_t)d[o + 1] << 8)) : 0; };
+		auto u32 = [&](size_t o) -> uint32_t
+		{
+			if (o + 4 > d.size()) return 0;
+			return (uint32_t)((uint8_t)d[o] | ((uint8_t)d[o + 1] << 8) | ((uint8_t)d[o + 2] << 16)
+			                | ((uint32_t)(uint8_t)d[o + 3] << 24));
+		};
+		if (d.size() < 0x40 || u16(0) != 0x5A4D) return 0;                 // "MZ"
+		const uint32_t peOff = u32(0x3C);
+		if (peOff + 24 > d.size() || u32(peOff) != 0x00004550) return 0;   // "PE\0\0"
+		const uint16_t nSec = u16(peOff + 6), optSize = u16(peOff + 20);
+		const size_t opt = peOff + 24;
+		const size_t dirs = opt + (u16(opt) == 0x20B ? 112 : 96);          // PE32+ / PE32
+		const uint32_t corRva = u32(dirs + 14 * 8);                        // CLI header directory
+		if (!corRva) return 0;                                             // unmanaged
+		const size_t secs = opt + optSize;
+		auto toOff = [&](uint32_t rva) -> size_t
+		{
+			for (uint16_t i = 0; i < nSec; ++i)
+			{
+				const size_t s = secs + (size_t)i * 40;
+				const uint32_t va = u32(s + 12), rawSz = u32(s + 16), raw = u32(s + 20);
+				if (rva >= va && rva < va + rawSz) return raw + (rva - va);
+			}
+			return 0;
+		};
+		const size_t cor = toOff(corRva);
+		if (!cor) return -1;
+		const size_t meta = toOff(u32(cor + 8));                           // MetaData RVA
+		if (!meta || u32(meta) != 0x424A5342) return -1;                   // "BSJB"
+		size_t p = meta + 16 + u32(meta + 12) + 4;                         // version, flags, count
+		const uint16_t streams = u16(p - 2);
+		for (uint16_t i = 0; i < streams && p + 8 < d.size(); ++i)
+		{
+			const uint32_t sOff = u32(p);
+			const char* name = d.data() + p + 8;
+			const size_t nameLen = strnlen(name, 32);
+			if (nameLen == 2 && name[0] == '#' && name[1] == '~')
+			{
+				const size_t tab = meta + sOff;
+				const uint64_t valid = (uint64_t)u32(tab + 8) | ((uint64_t)u32(tab + 12) << 32);
+				pinvoke = (valid & (1ull << 28)) != 0;                     // ImplMap = P/Invoke
+				return 1;
+			}
+			p += 8 + ((nameLen + 1 + 3) & ~(size_t)3);
+		}
+		return 1;   // managed, but no table stream found: treat as portable
+	}
+public:
+
 };
 static CSharpScriptService gMonoService;
 
