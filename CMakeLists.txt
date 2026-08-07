@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(NukeCSharp CXX)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/cmake/NukeRunDir.cmake")   # NUKE_RUN_SUBDIR: x64 / macos / linux
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -13,7 +15,7 @@ set(VCPKG_INSTALLED "$ENV{VCPKG_ROOT}/installed/x64-windows")
 
 # nukegen (modular reflection): generate NukeCSharp.gen.inc registering this module's [[nuke::prop]]
 # components. NukeCSharp.cpp #includes it in-TU + calls NukeReflectInit_NukeCSharp() from OnLoad.
-set(NUKE_GEN "${NUKE_ROOT}/NukeUtils/bin/NukeGen.exe")   # built FIRST by the superbuild
+set(NUKE_GEN "${NUKE_ROOT}/NukeUtils/bin/NukeGen${NUKE_HOSTTOOL_SUFFIX}")   # built FIRST by the superbuild
 set(NUKECSHARP_GEN "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeCSharp.gen.inc")
 add_custom_command(
     OUTPUT  "${NUKECSHARP_GEN}"
@@ -37,11 +39,21 @@ add_dependencies(NukeCSharp NukeCSharpGen)   # generate the reflection .inc befo
 # the managed bridge (managed/NukeEngine.Managed) is built by dotnet below and shipped to
 # modules/managed/.
 target_compile_definitions(NukeCSharp PRIVATE
-    WIN32 _WINDOWS NOMINMAX _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS
+    _USE_MATH_DEFINES
     GLM_ENABLE_EXPERIMENTAL
-    BOOST_ALL_DYN_LINK
-    BOOST_ALL_NO_LIB     # autolink picked MIXED runtimes (release boost in a /MDd build) — link explicitly below
 )
+if(WIN32)
+    target_compile_definitions(NukeCSharp PRIVATE
+        WIN32 _WINDOWS NOMINMAX _CRT_SECURE_NO_WARNINGS
+        BOOST_ALL_DYN_LINK
+        BOOST_ALL_NO_LIB     # autolink picked MIXED runtimes (release boost in a /MDd build) — link explicitly below
+    )
+else()
+    target_compile_options(NukeCSharp PRIVATE -Wno-c++11-narrowing -Wno-unknown-attributes)
+    set_target_properties(NukeCSharp PROPERTIES
+        PREFIX ""
+        BUILD_RPATH "@loader_path/..;$ORIGIN/..")
+endif()
 
 target_include_directories(NukeCSharp PRIVATE
     ${NUKE_ROOT}/NukeEngine
@@ -52,20 +64,22 @@ target_include_directories(NukeCSharp PRIVATE
 
 target_link_directories(NukeCSharp PRIVATE
     ${VCPKG_INSTALLED}/$<$<CONFIG:Debug>:debug/>lib   # boost auto-link (header chain)
-    ${NUKE_ROOT}/NukeEngine/x64/$<CONFIG>             # NukeEngine.dll import lib
+    ${NUKE_ROOT}/NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>             # NukeEngine.dll import lib
 )
 
 target_link_libraries(NukeCSharp PRIVATE
     NukeEngine
-    debug boost_filesystem-vc143-mt-gd-x64-1_91 optimized boost_filesystem-vc143-mt-x64-1_91
-    debug boost_thread-vc143-mt-gd-x64-1_91     optimized boost_thread-vc143-mt-x64-1_91
-    debug boost_chrono-vc143-mt-gd-x64-1_91     optimized boost_chrono-vc143-mt-x64-1_91
+    # MSVC: explicit boost (autolink disabled above). Off Windows boost rides in PUBLIC
+    # on the NukeEngine CMake target.
+    $<$<PLATFORM_ID:Windows>:$<IF:$<CONFIG:Debug>,boost_filesystem-vc143-mt-gd-x64-1_91,boost_filesystem-vc143-mt-x64-1_91>>
+    $<$<PLATFORM_ID:Windows>:$<IF:$<CONFIG:Debug>,boost_thread-vc143-mt-gd-x64-1_91,boost_thread-vc143-mt-x64-1_91>>
+    $<$<PLATFORM_ID:Windows>:$<IF:$<CONFIG:Debug>,boost_chrono-vc143-mt-gd-x64-1_91,boost_chrono-vc143-mt-x64-1_91>>
 )
 
 # Deploy: the plugin DLL into modules/, the managed bridge into modules/managed/.
 # `dotnet build` runs as part of the post-build (needs the .NET SDK on the dev machine —
 # the SHIPPED game only needs the runtime).
-set(MODULES_DIR "${NUKE_ROOT}/NukeEngine/x64/$<CONFIG>/modules")
+set(MODULES_DIR "${NUKE_ROOT}/NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>/modules")
 set(MANAGED_SRC "${CMAKE_CURRENT_SOURCE_DIR}/managed/NukeEngine.Managed")
 add_custom_command(TARGET NukeCSharp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULES_DIR}/managed"

@@ -50,21 +50,34 @@
 #include <string>
 #include <vector>
 
-// Windows-only for now (hostfxr paths are wchar_t; the module list is per-platform anyway).
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <dlfcn.h>    // dlopen/dlsym for libhostfxr
+#include <cstdio>     // popen/pclose (dotnet build capture)
+#include <sys/wait.h> // WIFEXITED/WEXITSTATUS
+#endif
 
 namespace bfs = boost::filesystem;
 using namespace nuke;
 using std::cout;
 using std::endl;
 
-// ---- hostfxr (Windows: char_t = wchar_t) -------------------------------------------------------
+// ---- hostfxr (char_t = wchar_t on Windows, char elsewhere) -------------------------------------
 
+#ifdef _WIN32
 typedef wchar_t hchar;
+#define HSTR(s) L##s
+static std::wstring HPath(const bfs::path& p) { return p.wstring(); }
+#else
+typedef char hchar;
+#define HSTR(s) s
+static std::string HPath(const bfs::path& p) { return p.string(); }
+#endif
 #define UNMANAGEDCALLERSONLY_METHOD ((const hchar*)-1)
 
 typedef int32_t (*hostfxr_initialize_fn)(const hchar* runtimeConfig, const void* params, void** hostHandle);
@@ -649,19 +662,31 @@ static bridge_liveprops_fn gLive    = nullptr;   // live-state capture on save (
 static int               gGeneration = 0;      // bumps on every game-assembly (re)load
 static bool              gHostUp = false;
 
-// Locate the newest hostfxr.dll under %ProgramFiles%\dotnet\host\fxr\<version>\.
-static std::wstring FindHostFxr()
+// Locate the newest hostfxr under the platform's dotnet install root.
+static std::basic_string<hchar> FindHostFxr()
 {
+#ifdef _WIN32
 	const char* pf = getenv("ProgramFiles");
-	bfs::path fxr = bfs::path(pf ? pf : "C:\\Program Files") / "dotnet" / "host" / "fxr";
+	bfs::path root = bfs::path(pf ? pf : "C:\\Program Files") / "dotnet";
+	const char* lib = "hostfxr.dll";
+#elif defined(__APPLE__)
+	const char* dr = getenv("DOTNET_ROOT");
+	bfs::path root = dr && *dr ? bfs::path(dr) : bfs::path("/usr/local/share/dotnet");
+	const char* lib = "libhostfxr.dylib";
+#else
+	const char* dr = getenv("DOTNET_ROOT");
+	bfs::path root = dr && *dr ? bfs::path(dr) : bfs::path("/usr/share/dotnet");
+	const char* lib = "libhostfxr.so";
+#endif
+	bfs::path fxr = root / "host" / "fxr";
 	boost::system::error_code ec;
-	if (!bfs::exists(fxr, ec)) return L"";
+	if (!bfs::exists(fxr, ec)) return std::basic_string<hchar>();
 	bfs::path best;
 	for (bfs::directory_iterator it(fxr, ec), end; it != end && !ec; it.increment(ec))
 		if (bfs::is_directory(it->path()) && (best.empty() || it->path().filename().string() > best.filename().string()))
 			best = it->path();
-	if (best.empty()) return L"";
-	return (best / "hostfxr.dll").wstring();
+	if (best.empty()) return std::basic_string<hchar>();
+	return HPath(best / lib);
 }
 
 // Start the runtime + resolve every Bridge entry point. Idempotent; false on any failure
@@ -670,13 +695,28 @@ static bool EnsureHost()
 {
 	if (gHostUp) return true;
 
-	std::wstring fxrPath = FindHostFxr();
-	if (fxrPath.empty()) { cout << "[NukeCSharp]\t.NET runtime not found (no %ProgramFiles%\\dotnet\\host\\fxr)" << endl; return false; }
+	std::basic_string<hchar> fxrPath = FindHostFxr();
+	if (fxrPath.empty()) { cout << "[NukeCSharp]\t.NET runtime not found (no dotnet/host/fxr; set DOTNET_ROOT?)" << endl; return false; }
+#ifdef _WIN32
 	HMODULE fxr = LoadLibraryW(fxrPath.c_str());
 	if (!fxr) { cout << "[NukeCSharp]\tcan't load hostfxr.dll" << endl; return false; }
 	auto init  = (hostfxr_initialize_fn)  GetProcAddress(fxr, "hostfxr_initialize_for_runtime_config");
 	auto getd  = (hostfxr_get_delegate_fn)GetProcAddress(fxr, "hostfxr_get_runtime_delegate");
 	auto close = (hostfxr_close_fn)       GetProcAddress(fxr, "hostfxr_close");
+#else
+	void* fxr = dlopen(fxrPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
+	if (!fxr)
+	{
+		// dlerror() CLEARS the error — call it once (an x86_64 slice can't load an
+		// arm64-only .NET install, for example; the module then just stays inert).
+		const char* dlerr = dlerror();
+		cout << "[NukeCSharp]\tcan't load libhostfxr: " << (dlerr ? dlerr : "?") << endl;
+		return false;
+	}
+	auto init  = (hostfxr_initialize_fn)  dlsym(fxr, "hostfxr_initialize_for_runtime_config");
+	auto getd  = (hostfxr_get_delegate_fn)dlsym(fxr, "hostfxr_get_runtime_delegate");
+	auto close = (hostfxr_close_fn)       dlsym(fxr, "hostfxr_close");
+#endif
 	if (!init || !getd || !close) { cout << "[NukeCSharp]\thostfxr exports missing" << endl; return false; }
 
 	// The bridge ships next to the module, with the runtimeconfig.json naming its framework.
@@ -688,7 +728,7 @@ static bool EnsureHost()
 	{ cout << "[NukeCSharp]\tmanaged bridge missing (modules/managed/) — module inert" << endl; return false; }
 
 	void* host = nullptr;
-	int rc = init(bfs::absolute(cfg).wstring().c_str(), nullptr, &host);
+	int rc = init(HPath(bfs::absolute(cfg)).c_str(), nullptr, &host);
 	if (rc != 0 && rc != 1 && rc != 2)   // 0 ok, 1/2 = already initialized (fine)
 	{ cout << "[NukeCSharp]\thostfxr init failed: 0x" << std::hex << rc << std::dec << endl; return false; }
 	load_assembly_and_get_function_pointer_fn loadAsm = nullptr;
@@ -696,28 +736,28 @@ static bool EnsureHost()
 	close(host);
 	if (rc != 0 || !loadAsm) { cout << "[NukeCSharp]\thostfxr delegate failed: 0x" << std::hex << rc << std::dec << endl; return false; }
 
-	const std::wstring asmPath = bfs::absolute(dll).wstring();
-	const hchar* type = L"NukeEngine.Bridge, NukeEngine.Managed";
+	const std::basic_string<hchar> asmPath = HPath(bfs::absolute(dll));
+	const hchar* type = HSTR("NukeEngine.Bridge, NukeEngine.Managed");
 	auto resolve = [&](const hchar* method, void** out) {
 		int r = loadAsm(asmPath.c_str(), type, method, UNMANAGEDCALLERSONLY_METHOD, nullptr, out);
 		if (r != 0) { cout << "[NukeCSharp]\tbridge method missing: " << (r) << endl; *out = nullptr; }
 		return r == 0;
 	};
 	bool ok = true;
-	ok &= resolve(L"Init",               (void**)&gInit);
-	ok &= resolve(L"LoadGameAssembly",   (void**)&gLoad);
-	ok &= resolve(L"AddGameAssembly",    (void**)&gAdd);
-	ok &= resolve(L"UnloadGameAssembly", (void**)&gUnload);
-	ok &= resolve(L"CreateScript",       (void**)&gCreate);
-	ok &= resolve(L"DestroyScript",      (void**)&gDestroy);
-	ok &= resolve(L"CallUpdate",         (void**)&gUpdate);
-	ok &= resolve(L"ListClasses",        (void**)&gList);
-	ok &= resolve(L"GetClassProps",      (void**)&gGetProps);
-	ok &= resolve(L"SetProp",            (void**)&gSetProp);
-	ok &= resolve(L"CallEvent",          (void**)&gEvent);
-	ok &= resolve(L"GetLiveProps",       (void**)&gLive);
-	ok &= resolve(L"RunJob",             (void**)&gRunJob);       // script jobs (6.10)
-	ok &= resolve(L"RunJobRange",        (void**)&gRunJobRange);
+	ok &= resolve(HSTR("Init"),               (void**)&gInit);
+	ok &= resolve(HSTR("LoadGameAssembly"),   (void**)&gLoad);
+	ok &= resolve(HSTR("AddGameAssembly"),    (void**)&gAdd);
+	ok &= resolve(HSTR("UnloadGameAssembly"), (void**)&gUnload);
+	ok &= resolve(HSTR("CreateScript"),       (void**)&gCreate);
+	ok &= resolve(HSTR("DestroyScript"),      (void**)&gDestroy);
+	ok &= resolve(HSTR("CallUpdate"),         (void**)&gUpdate);
+	ok &= resolve(HSTR("ListClasses"),        (void**)&gList);
+	ok &= resolve(HSTR("GetClassProps"),      (void**)&gGetProps);
+	ok &= resolve(HSTR("SetProp"),            (void**)&gSetProp);
+	ok &= resolve(HSTR("CallEvent"),          (void**)&gEvent);
+	ok &= resolve(HSTR("GetLiveProps"),       (void**)&gLive);
+	ok &= resolve(HSTR("RunJob"),             (void**)&gRunJob);       // script jobs (6.10)
+	ok &= resolve(HSTR("RunJobRange"),        (void**)&gRunJobRange);
 	if (!ok) return false;
 	if (gInit(&gApi) != 1) { cout << "[NukeCSharp]\tbridge Init failed" << endl; return false; }
 	gHostUp = true;
@@ -1112,6 +1152,22 @@ static bool CompileGameScripts(const bfs::path& projectDir, const std::vector<bf
 	std::string cmd = "dotnet build \"" + (managed / "GameScripts.csproj").string()
 	                + "\" -c Release -o \"" + (managed / "bin").string() + "\" --nologo -v q";
 	// Capture the compiler's output so a failed build can name its errors in the Console.
+#ifndef _WIN32
+	std::string output;
+	unsigned long code = 1;
+	if (FILE* p = popen((cmd + " 2>&1").c_str(), "r"))
+	{
+		char pbuf[4096]; size_t pgot;
+		while ((pgot = fread(pbuf, 1, sizeof(pbuf), p)) > 0) output.append(pbuf, pgot);
+		const int st = pclose(p);
+		code = (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : 1;
+	}
+	else
+	{
+		cout << "[NukeCSharp]\tdotnet not found — install the .NET SDK to compile C# scripts" << endl;
+		return false;
+	}
+#else
 	SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
 	HANDLE rd = NULL, wr = NULL;
 	CreatePipe(&rd, &wr, &sa, 0);
@@ -1138,6 +1194,7 @@ static bool CompileGameScripts(const bfs::path& projectDir, const std::vector<bf
 	DWORD code = 1;
 	GetExitCodeProcess(pi.hProcess, &code);
 	CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+#endif   // _WIN32
 	if (code != 0)
 	{
 		cout << "[NukeCSharp]\tC# build FAILED (dotnet build exit " << code << "):" << endl;
@@ -1687,6 +1744,12 @@ public:
 		HMODULE self = nullptr;
 		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
 		                   reinterpret_cast<LPCWSTR>(&NukeReflectInit_NukeCSharp), &self);
+#else
+		// Same pin on POSIX: a deliberately-leaked self-dlopen keeps the image mapped for
+		// the process lifetime — CoreCLR threads must never wake up in unmapped code.
+		Dl_info di{};
+		if (dladdr(reinterpret_cast<void*>(&NukeReflectInit_NukeCSharp), &di) && di.dli_fname)
+			(void)dlopen(di.dli_fname, RTLD_NOW | RTLD_NODELETE);
 #endif
 		NukeReflectInit_NukeCSharp();   // register this module's reflected components (generated)
 		cout << "[NukeCSharp]\tCSharpScript registered." << endl;
