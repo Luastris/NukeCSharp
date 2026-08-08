@@ -101,6 +101,12 @@ typedef void  (*bridge_setprop_fn)(void* handle, const char* nameUtf8, const cha
 typedef void  (*bridge_event_fn)(void* handle, const char* nameUtf8, const char* payloadUtf8);
 typedef int   (*bridge_liveprops_fn)(void* handle, void* buf, int cap);   // -1 = SaveMode.None
 
+// MSVC/AppleClang swallow __cdecl as calling-convention noise; GCC doesn't know the word.
+// On x86-64/arm64 System V there is exactly one C calling convention anyway.
+#if !defined(_WIN32) && !defined(__APPLE__)
+#define __cdecl
+#endif
+
 // Managed -> native function table. LAYOUT MUST MATCH Bridge.cs NativeApi exactly, and may
 // be extended ONLY by appending (both sides in the same change).
 struct NativeApi
@@ -677,6 +683,14 @@ static std::basic_string<hchar> FindHostFxr()
 	const char* dr = getenv("DOTNET_ROOT");
 	bfs::path root = dr && *dr ? bfs::path(dr) : bfs::path("/usr/share/dotnet");
 	const char* lib = "libhostfxr.so";
+	// Distro packages disagree on the install root — probe the common ones when the
+	// default (Microsoft feed layout) isn't there.
+	{
+		boost::system::error_code pec;
+		if ((!dr || !*dr) && !bfs::exists(root / "host" / "fxr", pec))
+			for (const char* alt : { "/usr/lib/dotnet", "/usr/lib64/dotnet", "/opt/dotnet" })
+				if (bfs::exists(bfs::path(alt) / "host" / "fxr", pec)) { root = alt; break; }
+	}
 #endif
 	bfs::path fxr = root / "host" / "fxr";
 	boost::system::error_code ec;
